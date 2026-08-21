@@ -23,9 +23,10 @@ use std::io::{BufRead, Read, Write};
 
 use crate::w365::{self, AccessToken, AuthError};
 
-/// How long to wait for the user to complete the browser sign-in
-/// (teams-tui-go's `browserFlowTimeout`).
-const LOOPBACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+/// How long to wait for the user to complete the browser sign-in. MFA-heavy
+/// tenants (HP/PingID passkeys) can take several minutes; 15 keeps the flow
+/// alive through them (teams-tui-go's 5-minute budget proved too tight).
+const LOOPBACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15 * 60);
 
 /// Open the system browser at `url` (best-effort; the URL is also printed).
 /// `command` may be a multi-word shell-free command line (e.g. teams-tui-go's

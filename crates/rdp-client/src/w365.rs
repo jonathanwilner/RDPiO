@@ -34,6 +34,11 @@ pub struct AccessToken {
     /// scope (`openid profile`) was requested. Used to default the RDSTLS logon
     /// username so the user need not pass `--user`.
     pub username: Option<String>,
+    /// Tenant GUID parsed from the `id_token` (`tid` claim). Some first-party
+    /// grants return an **opaque** access token (not a JWT), so the tenant
+    /// cannot be derived from it later — it is captured here at exchange time
+    /// for the ARM feed-discovery request.
+    pub tenant_id: Option<String>,
     /// The app registration that actually minted this token (the `client_id`
     /// sent to the token endpoint). Tokens can be acquired through different
     /// registrations (rdpio's AVD client, or the teams-tui-go login reused via
@@ -121,6 +126,7 @@ impl DeviceCodeFlow {
             refresh_token,
             expires_in: Duration::from_secs(expires_in),
             username: token_resp["id_token"].as_str().and_then(parse_id_token_upn),
+            tenant_id: id_token_tid(&token_resp),
             client_id: Some(self.client_id.clone()),
         }))
     }
@@ -315,6 +321,7 @@ pub fn refresh_token(
         refresh_token: resp["refresh_token"].as_str().map(String::from),
         expires_in: Duration::from_secs(resp["expires_in"].as_u64().unwrap_or(3600)),
         username: resp["id_token"].as_str().and_then(parse_id_token_upn),
+        tenant_id: id_token_tid(&resp),
         client_id: Some(client_id.to_string()),
     })
 }
@@ -436,6 +443,7 @@ pub fn exchange_auth_code_full(
         refresh_token: resp["refresh_token"].as_str().map(String::from),
         expires_in: Duration::from_secs(resp["expires_in"].as_u64().unwrap_or(3600)),
         username: resp["id_token"].as_str().and_then(parse_id_token_upn),
+        tenant_id: id_token_tid(&resp),
         client_id: Some(client_id.to_string()),
     })
 }
@@ -540,6 +548,19 @@ fn decode_jwt_claims(jwt: &str) -> Option<serde_json::Value> {
     serde_json::from_slice(&bytes).ok()
 }
 
+/// Extract the tenant GUID (`tid`) from an OIDC `id_token`. Unlike the access
+/// token (which some first-party grants return opaque), the id_token is always
+/// a JWT carrying `tid`.
+fn id_token_tid(resp: &serde_json::Value) -> Option<String> {
+    resp.get("id_token")?
+        .as_str()
+        .and_then(decode_jwt_claims)?
+        .get("tid")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+}
+
 /// The tenant GUID the token was actually issued for (`tid` claim). When the
 /// caller authenticated against `common`, the ARM feed-discovery endpoint wants
 /// the concrete tenant id, so this derives it from the token itself.
@@ -556,9 +577,10 @@ pub fn token_tenant(token: &str) -> Option<String> {
 // `/api/feeddiscovery` path returns 404/redirect for Entra-ID tenants.
 const DEFAULT_FEED_URL: &str = "https://rdweb.wvd.microsoft.com/api/arm/feeddiscovery";
 /// The AVD web workspace identifies itself to the feed endpoints as the
-/// RemoteApp client (`TSWorkspace/2.0`); the same UA is accepted for direct
-/// `.rdp` resource downloads.
-const FEED_USER_AGENT: &str = "TSWorkspace/2.0";
+/// first-party Remote Desktop client. The service gates on an approved
+/// client: requests without a recognized `X-MS-User-Agent` are rejected with
+/// `INCOMPATIBLE_CLIENT_VERSION` (HTTP 400). Verified live: `MSRDC` passes.
+const FEED_USER_AGENT: &str = "MSRDC/10.0.0";
 
 /// GET `url` with the AVD bearer token and the workspace user agent. Sanitized
 /// logging: host + status + body length only — signed resource URLs carry auth
@@ -570,7 +592,8 @@ fn fetch_authenticated(url: &str, token: &str, authorized: bool) -> Result<Strin
         .unwrap_or_else(|| "<invalid-url>".to_string());
     let mut req = ureq::get(url)
         .set("Accept", "application/json, application/xml, text/*")
-        .set("User-Agent", FEED_USER_AGENT);
+        .set("User-Agent", FEED_USER_AGENT)
+        .set("X-MS-User-Agent", FEED_USER_AGENT);
     if authorized {
         req = req.set("Authorization", &format!("Bearer {token}"));
     }
@@ -600,6 +623,21 @@ fn extract_feed_url(body: &str) -> Option<String> {
         .map(String::from)
 }
 
+/// Extract every per-workspace `FeedURL` from a MS-TSWF `TenantFeedURLs`
+/// discovery document (the real `feeddiscovery` response for ARM tenants:
+/// one `TenantFeedURL` per subscribed workspace, each naming its regional
+/// webfeed). Namespace-agnostic: the doc carries the tswfdiscovery xmlns.
+fn extract_feed_urls(body: &str) -> Vec<String> {
+    let Ok(doc) = roxmltree::Document::parse(body) else {
+        return Vec::new();
+    };
+    doc.descendants()
+        .filter(|n| n.has_tag_name("TenantFeedURL"))
+        .filter_map(|n| n.attribute("FeedURL").map(String::from))
+        .filter(|u| !u.is_empty())
+        .collect()
+}
+
 /// Fetch the W365/AVD feed for `tenant_id` using the authenticated access token.
 ///
 /// `client_id` is the AAD application id used for the feed request; `None`
@@ -615,10 +653,11 @@ pub fn fetch_feed(
     // wants the tenant the token was issued for. Derive it from the `tid`
     // claim instead of asking the user for a GUID.
     let tenant_id = if tenant_id.eq_ignore_ascii_case("common") || tenant_id.is_empty() {
-        match token_tenant(&token.token) {
-            Some(tid) => tid,
-            None => tenant_id.to_string(),
-        }
+        token
+            .tenant_id
+            .clone()
+            .or_else(|| token_tenant(&token.token))
+            .unwrap_or_else(|| tenant_id.to_string())
     } else {
         tenant_id.to_string()
     };
@@ -637,6 +676,21 @@ pub fn fetch_feed(
     if let Some(feed_url) = extract_feed_url(&body) {
         tracing::info!("discovery returned a feed envelope; following FeedUrl");
         body = fetch_authenticated(&feed_url, &token.token, true)?;
+    }
+
+    // ARM tenants answer discovery with a TenantFeedURLs document naming one
+    // regional webfeed per subscribed workspace — follow each and merge.
+    if body.contains("TenantFeedURL") {
+        let feed_urls = extract_feed_urls(&body);
+        tracing::info!(workspaces = feed_urls.len(), "discovery returned workspace feeds");
+        let mut entries = Vec::new();
+        for feed_url in &feed_urls {
+            let feed_body = fetch_authenticated(feed_url, &token.token, true)?;
+            let parsed = crate::feed::parse(&feed_body)
+                .map_err(|e| AuthError::Failed(format!("feed parse error: {e}")))?;
+            entries.extend(parsed);
+        }
+        return Ok(entries);
     }
 
     crate::feed::parse(&body).map_err(|e| AuthError::Failed(format!("feed parse error: {e}")))
@@ -955,5 +1009,25 @@ mod tests {
             None
         );
         assert_eq!(extract_feed_url("{\"error\":\"x\"}"), None);
+    }
+
+    #[test]
+    fn discovery_doc_yields_workspace_feed_urls() {
+        let doc = "<?xml version=\"1.0\" encoding=\"utf-8\"?>
+<TenantFeedURLs xmlns=\"http://schemas.microsoft.com/ts/2014/03/tswfdiscovery\">
+  <TenantFeedURL TenantId=\"11111111-1111-1111-1111-111111111111\"
+      FeedURL=\"https://rdweb.wvd.microsoft.com/api/arm/feeddiscovery/tenants/aaa/webfeed?geo=US\">
+    <Extensions><Extension ID=\"x\" Name=\"CloudPC\" BaseURL=\"https://windows365.microsoft.com\"/></Extensions>
+  </TenantFeedURL>
+  <TenantFeedURL TenantId=\"22222222-2222-2222-2222-222222222222\"
+      FeedURL=\"https://rdweb.wvd.microsoft.com/api/arm/feeddiscovery/tenants/bbb/webfeed?geo=EU\"/>
+</TenantFeedURLs>";
+        let urls = extract_feed_urls(doc);
+        assert_eq!(urls.len(), 2);
+        assert!(urls[0].ends_with("webfeed?geo=US"));
+        assert!(urls[1].contains("tenants/bbb"));
+        // Non-discovery documents yield nothing.
+        assert!(extract_feed_urls("<ResourceCollection/>").is_empty());
+        assert!(extract_feed_urls("not xml").is_empty());
     }
 }

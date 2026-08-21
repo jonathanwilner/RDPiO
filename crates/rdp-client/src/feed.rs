@@ -86,7 +86,9 @@ pub fn fetch(url: &str) -> Result<Vec<FeedEntry>, FeedError> {
 /// Parse a feed document already loaded into memory. XML (RDWeb webfeed) and a
 /// simple JSON array format are both accepted.
 pub fn parse(body: &str) -> Result<Vec<FeedEntry>, FeedError> {
-    let trimmed = body.trim_start();
+    // Microsoft's webfeed responses carry a UTF-8 BOM before the XML
+    // declaration; U+FEFF is not `char::is_whitespace`, so strip it explicitly.
+    let trimmed = body.trim_start().trim_start_matches('\u{feff}');
     if trimmed.starts_with('<') {
         parse_xml(trimmed)
     } else if trimmed.starts_with('[') || trimmed.starts_with('{') {

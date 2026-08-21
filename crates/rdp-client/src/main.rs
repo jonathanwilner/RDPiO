@@ -580,8 +580,13 @@ fn run_w365_freerdp(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     };
 
 /// Resolve the Linux W365 interactive login flow. Precedence mirrors the rest
-/// of the CLI: explicit `--w365-auth` → `RDPIO_W365_AUTH` → teams-tui-go's
-/// `auth_flow` (its config drives its own CLI the same way) → `paste`.
+/// of the CLI: explicit `--w365-auth` → `RDPIO_W365_AUTH` → `paste`.
+///
+/// Note: only rdpio's AVD client (`a85cf173`) is preauthorized for the WVD
+/// resource (teams-tui-go's loopback client is Graph-only — AADSTS650057 —
+/// and the Teams/Office clients are preauth-blocked — AADSTS65002), so the
+/// nativeclient paste flow is the default; `browser`/`device` remain explicit
+/// opt-ins for tenants where those registration pairs are permitted.
 #[cfg(not(windows))]
 fn resolve_w365_auth_flow(args: &Args) -> String {
     if let Some(flow) = args.w365_auth.as_deref() {
@@ -593,13 +598,7 @@ fn resolve_w365_auth_flow(args: &Args) -> String {
             other => tracing::warn!(flow = %other, "ignoring unknown RDPIO_W365_AUTH"),
         }
     }
-    match teams_auth::load_config() {
-        Ok(Some(cfg)) => match cfg.auth_flow.as_str() {
-            "browser" | "device" => cfg.auth_flow,
-            _ => "paste".into(),
-        },
-        _ => "paste".into(),
-    }
+    "paste".into()
 }
 
 /// Authenticate and discover the workspace via the existing AVD machinery,

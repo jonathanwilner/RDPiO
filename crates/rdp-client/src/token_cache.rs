@@ -87,6 +87,7 @@ fn cache_doc(tenant: &str, client_id: Option<&str>, token: &AccessToken) -> Stri
         "access_token": token.token,
         "expires_at": expires_at,
         "username": token.username,
+        "tenant_id": token.tenant_id,
     })
     .to_string()
 }
@@ -313,6 +314,13 @@ pub fn load_silent(tenant: &str, client_id: Option<&str>) -> Option<AccessToken>
         .get("username")
         .and_then(|v| v.as_str())
         .map(String::from);
+    // Tenant GUID captured at exchange time (opaque access tokens cannot be
+    // re-derived later; the ARM feed needs it on every run).
+    let tenant_id = doc
+        .get("tenant_id")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(String::from);
     // The registration that minted the cached token: the new `token_client_id`
     // when present, else the doc's `client_id` (caches written before the
     // teams-tui-go reuse existed only ever used the requested client).
@@ -338,6 +346,7 @@ pub fn load_silent(tenant: &str, client_id: Option<&str>) -> Option<AccessToken>
                 refresh_token: refresh.map(String::from),
                 expires_in: Duration::from_secs(expires_at.saturating_sub(now_unix())),
                 username,
+                tenant_id,
                 client_id: mint_client,
             });
         }
@@ -398,6 +407,7 @@ mod tests {
             refresh_token: Some("refresh-1".into()),
             expires_in: std::time::Duration::from_secs(3600),
             username: Some("nick@contoso.com".into()),
+            tenant_id: None,
             client_id: None,
         }
     }
@@ -461,6 +471,7 @@ mod tests {
 
         let mut t = token();
         t.client_id = Some("d3590ed6-52b3-4102-aeff-aad2292ab01c".into());
+        t.tenant_id = Some("9188040d-1c1c-4c2d-8ab7-2e5e0f123456".into());
         store(tenant, client_id, &t);
 
         let path = tmp.join("rdpio").join(CACHE_FILE);
@@ -470,12 +481,21 @@ mod tests {
             doc["token_client_id"].as_str(),
             Some("d3590ed6-52b3-4102-aeff-aad2292ab01c")
         );
+        assert_eq!(
+            doc["tenant_id"].as_str(),
+            Some("9188040d-1c1c-4c2d-8ab7-2e5e0f123456")
+        );
 
-        // Cached access token still valid → returned with the minting client.
+        // Cached access token still valid → returned with the minting client
+        // and the tenant.
         let cached = load_silent(tenant, client_id).expect("silent load");
         assert_eq!(
             cached.client_id.as_deref(),
             Some("d3590ed6-52b3-4102-aeff-aad2292ab01c")
+        );
+        assert_eq!(
+            cached.tenant_id.as_deref(),
+            Some("9188040d-1c1c-4c2d-8ab7-2e5e0f123456")
         );
 
         clear(tenant, client_id).unwrap();
