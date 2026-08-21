@@ -360,7 +360,6 @@ pub fn clear(tenant: &str, client_id: Option<&str>) -> io::Result<()> {
     }
 }
 
-
 #[cfg(all(test, not(windows)))]
 mod tests {
     use super::*;

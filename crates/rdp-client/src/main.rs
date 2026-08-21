@@ -5100,6 +5100,9 @@ mod w365_backend_tests {
         assert!(decide_camera(Some(true), Rs::Yes, 0).unwrap());
         // Missing RDPECAM + explicit --camera is an actionable error.
         let err = decide_camera(Some(true), Rs::No, 1).unwrap_err();
-        assert!(err.contains("CHANNEL_RDPECAM_CLIENT"), "error must name the build flag: {err}");
+        assert!(
+            err.contains("CHANNEL_RDPECAM_CLIENT"),
+            "error must name the build flag: {err}"
+        );
     }
 }
