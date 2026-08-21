@@ -328,12 +328,23 @@ const AUTH_CODE_SCOPE: &str =
     "https://www.wvd.microsoft.com/.default openid profile offline_access";
 
 /// Build the authorization-code request URL to load in the login WebView.
-pub fn build_authorize_url(tenant: &str, client_id: Option<&str>, scope: Option<&str>) -> String {
+/// `state` is echoed back on the redirect; pass one when the caller can
+/// verify it (the Linux browser flow does — the WebView2 flow intercepts the
+/// redirect locally and skips it).
+pub fn build_authorize_url(
+    tenant: &str,
+    client_id: Option<&str>,
+    scope: Option<&str>,
+    state: Option<&str>,
+) -> String {
     let client_id = client_id.unwrap_or(DEFAULT_CLIENT_ID);
     let scope = scope.unwrap_or(AUTH_CODE_SCOPE);
+    let state = state
+        .map(|s| format!("&state={}", url_encode(s)))
+        .unwrap_or_default();
     format!(
         "https://login.microsoftonline.com/{tenant}/oauth2/v2.0/authorize\
-         ?client_id={cid}&response_type=code&scope={scope}&redirect_uri={redir}",
+         ?client_id={cid}&response_type=code&scope={scope}&redirect_uri={redir}{state}",
         tenant = tenant,
         cid = url_encode(client_id),
         scope = url_encode(scope),
@@ -396,13 +407,88 @@ pub fn exchange_auth_code(
     })
 }
 
+/// Parse an intercepted navigation or pasted final URL. Returns
+/// `Some(Ok(code))` when `uri` is the native-client redirect carrying an
+/// authorization `code`, `Some(Err(msg))` when it carries an OAuth `error`,
+/// and `None` for any other URL (the login pages themselves). Shared by the
+/// WebView2 panel (Windows) and the system-browser flow (Linux).
+pub fn parse_auth_redirect(uri: &str) -> Option<Result<String, String>> {
+    let query = uri.strip_prefix(NATIVE_REDIRECT_URI)?;
+    // The redirect is `<redirect_uri>?code=...` (or `?error=...`). Tolerate an
+    // exact match with no query as "not yet".
+    let query = query
+        .strip_prefix('?')
+        .or_else(|| query.strip_prefix('#'))?;
+    let mut code = None;
+    let mut error = None;
+    for pair in query.split('&') {
+        let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+        match k {
+            "code" => code = Some(url_decode(v)),
+            "error" => error = Some(url_decode(v)),
+            "error_description" if error.is_some() => {
+                error = Some(format!("{}: {}", error.unwrap(), url_decode(v)));
+            }
+            _ => {}
+        }
+    }
+    if let Some(c) = code {
+        Some(Ok(c))
+    } else {
+        error.map(Err)
+    }
+}
+
+/// Return one `application/x-www-form-urlencoded` query parameter from a URL
+/// (decoded). Used to read back the OAuth `state` echoed on the redirect.
+#[cfg_attr(windows, allow(dead_code))] // only the Linux browser flow sends state
+pub fn query_param(uri: &str, key: &str) -> Option<String> {
+    let start = uri.find('?').or_else(|| uri.find('#'))? + 1;
+    for pair in uri[start..].split('&') {
+        let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+        if k == key {
+            return Some(url_decode(v));
+        }
+    }
+    None
+}
+
+/// Minimal `application/x-www-form-urlencoded` decoder for redirect query values.
+pub fn url_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'%' if i + 2 < bytes.len() => {
+                let hi = (bytes[i + 1] as char).to_digit(16);
+                let lo = (bytes[i + 2] as char).to_digit(16);
+                if let (Some(hi), Some(lo)) = (hi, lo) {
+                    out.push((hi * 16 + lo) as u8);
+                    i += 3;
+                    continue;
+                }
+                out.push(b'%');
+                i += 1;
+            }
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 /// Extract the user principal name from an OIDC `id_token` (the unverified JWT
 /// payload — we only read a display/login hint from it, we do not trust it for
 /// authorization). Prefers `upn`, then `preferred_username`, then `email`.
 fn parse_id_token_upn(id_token: &str) -> Option<String> {
-    let payload_b64 = id_token.split('.').nth(1)?;
-    let bytes = crate::arm_broker::decode_b64(payload_b64)?;
-    let claims: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    let claims = decode_jwt_claims(id_token)?;
     for key in ["upn", "preferred_username", "email", "unique_name"] {
         if let Some(v) = claims.get(key).and_then(|v| v.as_str()) {
             if !v.is_empty() {
@@ -413,9 +499,74 @@ fn parse_id_token_upn(id_token: &str) -> Option<String> {
     None
 }
 
+/// Decode the JWT payload claims of a Microsoft token (`id_token` or access
+/// token). Unverified — only used for display hints (UPN) and routing data
+/// (tenant id), never for authorization. Never log the token itself.
+fn decode_jwt_claims(jwt: &str) -> Option<serde_json::Value> {
+    let payload_b64 = jwt.split('.').nth(1)?;
+    let bytes = crate::arm_broker::decode_b64(payload_b64)?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+/// The tenant GUID the token was actually issued for (`tid` claim). When the
+/// caller authenticated against `common`, the ARM feed-discovery endpoint wants
+/// the concrete tenant id, so this derives it from the token itself.
+pub fn token_tenant(token: &str) -> Option<String> {
+    decode_jwt_claims(token)?
+        .get("tid")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+}
+
+// --- W365/AVD feed discovery -----------------------------------------------
 // The modern AVD/W365 feed discovery endpoint is ARM-based. The non-ARM
 // `/api/feeddiscovery` path returns 404/redirect for Entra-ID tenants.
 const DEFAULT_FEED_URL: &str = "https://rdweb.wvd.microsoft.com/api/arm/feeddiscovery";
+/// The AVD web workspace identifies itself to the feed endpoints as the
+/// RemoteApp client (`TSWorkspace/2.0`); the same UA is accepted for direct
+/// `.rdp` resource downloads.
+const FEED_USER_AGENT: &str = "TSWorkspace/2.0";
+
+/// GET `url` with the AVD bearer token and the workspace user agent. Sanitized
+/// logging: host + status + body length only — signed resource URLs carry auth
+/// material in their query strings and must never be logged whole.
+fn fetch_authenticated(url: &str, token: &str, authorized: bool) -> Result<String, AuthError> {
+    let host = url::Url::parse(url)
+        .ok()
+        .and_then(|u| u.host_str().map(String::from))
+        .unwrap_or_else(|| "<invalid-url>".to_string());
+    let mut req = ureq::get(url)
+        .set("Accept", "application/json, application/xml, text/*")
+        .set("User-Agent", FEED_USER_AGENT);
+    if authorized {
+        req = req.set("Authorization", &format!("Bearer {token}"));
+    }
+    let resp = req.call()?;
+    let status = resp.status();
+    let body = resp.into_string()?;
+    tracing::debug!(host = %host, status, len = body.len(), "fetched feed resource");
+    Ok(body)
+}
+
+/// Some AVD discovery deployments answer the discovery URL with a small JSON
+/// envelope pointing at the real workspace feed (`{"FeedUrl": ...}`) rather
+/// than the feed document itself. Extract that follow-up URL when present.
+fn extract_feed_url(body: &str) -> Option<String> {
+    let trimmed = body.trim_start();
+    if !trimmed.starts_with('{') {
+        return None;
+    }
+    let v: serde_json::Value = serde_json::from_str(trimmed).ok()?;
+    if v.get("error").is_some() {
+        return None;
+    }
+    v.get("FeedUrl")
+        .or_else(|| v.get("feedUrl"))
+        .and_then(|u| u.as_str())
+        .filter(|u| !u.is_empty())
+        .map(String::from)
+}
 
 /// Fetch the W365/AVD feed for `tenant_id` using the authenticated access token.
 ///
@@ -428,24 +579,105 @@ pub fn fetch_feed(
     feed_url: Option<&str>,
 ) -> Result<Vec<crate::feed::FeedEntry>, AuthError> {
     let client_id = client_id.unwrap_or(DEFAULT_CLIENT_ID);
+    // `common` is only an auth-directory selector; the ARM discovery endpoint
+    // wants the tenant the token was issued for. Derive it from the `tid`
+    // claim instead of asking the user for a GUID.
+    let tenant_id = if tenant_id.eq_ignore_ascii_case("common") || tenant_id.is_empty() {
+        match token_tenant(&token.token) {
+            Some(tid) => tid,
+            None => tenant_id.to_string(),
+        }
+    } else {
+        tenant_id.to_string()
+    };
+
     let url = feed_url.map(String::from).unwrap_or_else(|| {
         format!(
             "{}?tenantId={}&appId={}",
             DEFAULT_FEED_URL,
-            url_encode(tenant_id),
+            url_encode(&tenant_id),
             url_encode(client_id)
         )
     });
 
-    tracing::info!(%url, "fetching W365 feed");
-    let auth = format!("Bearer {}", token.token);
-    let body = ureq::get(&url)
-        .set("Authorization", &auth)
-        .set("Accept", "application/json, application/xml, text/*")
-        .call()?
-        .into_string()?;
+    tracing::info!(tenant = %tenant_id, "fetching W365 feed");
+    let mut body = fetch_authenticated(&url, &token.token, true)?;
+    if let Some(feed_url) = extract_feed_url(&body) {
+        tracing::info!("discovery returned a feed envelope; following FeedUrl");
+        body = fetch_authenticated(&feed_url, &token.token, true)?;
+    }
 
     crate::feed::parse(&body).map_err(|e| AuthError::Failed(format!("feed parse error: {e}")))
+}
+
+/// Download Microsoft's current signed `.rdp` connection resource for a feed
+/// entry's `rdp_url`.
+///
+/// The URL came from the authenticated feed, so the first request carries the
+/// AVD bearer token (as the Windows App does). If the service answers 401/403 —
+/// some deployments serve the pre-signed resource without any Authorization —
+/// the request is retried without the token, but only when the URL is HTTPS on
+/// known Microsoft AVD infrastructure. Bearer tokens are never sent anywhere
+/// else, and signed URLs are never logged.
+#[cfg_attr(windows, allow(dead_code))] // consumed by the Linux FreeRDP backend
+pub fn fetch_rdp_file(token: &AccessToken, url: &str) -> Result<String, AuthError> {
+    let host = url::Url::parse(url)
+        .ok()
+        .and_then(|u| u.host_str().map(String::from))
+        .unwrap_or_default();
+    tracing::info!(host = %host, "retrieving Microsoft .rdp resource");
+
+    let body = match fetch_authenticated(url, &token.token, true) {
+        Ok(body) => body,
+        Err(AuthError::Network(ureq::Error::Status(code, _)))
+            if (code == 401 || code == 403) && is_microsoft_avd_host(url) =>
+        {
+            tracing::info!(host = %host, status = code, "signed resource refused the bearer token; retrying without it");
+            fetch_authenticated(url, &token.token, false)?
+        }
+        Err(e) => return Err(e.into()),
+    };
+
+    if let Err(reason) = looks_like_rdp(&body) {
+        return Err(AuthError::Failed(format!(
+            ".rdp download from {host} does not look like an RDP file ({reason})"
+        )));
+    }
+    Ok(body)
+}
+
+/// Hosts that are allowed to receive a tokenless retry for `.rdp` downloads.
+#[cfg_attr(windows, allow(dead_code))]
+fn is_microsoft_avd_host(url: &str) -> bool {
+    match url::Url::parse(url) {
+        Ok(u) if u.scheme() == "https" => u
+            .host_str()
+            .map(|h| {
+                h.eq_ignore_ascii_case("rdweb.wvd.microsoft.com")
+                    || h.ends_with(".wvd.microsoft.com")
+                    || h.ends_with(".microsoft.com") && h.starts_with("rdweb")
+            })
+            .unwrap_or(false),
+        _ => false,
+    }
+}
+
+/// Reject obviously-invalid `.rdp` downloads (e.g. an HTML login page served
+/// in place of the resource). The payload is Microsoft's source of truth and is
+/// stored verbatim; this only sanity-checks the shape.
+#[cfg_attr(windows, allow(dead_code))]
+fn looks_like_rdp(body: &str) -> Result<(), &'static str> {
+    let trimmed = body.trim_start();
+    if trimmed.starts_with('<') {
+        return Err("response is HTML/XML, not an RDP file");
+    }
+    if !body.contains("full address")
+        && !body.contains("resourceprovider")
+        && !body.contains("gatewayhostname")
+    {
+        return Err("no RDP connection settings found");
+    }
+    Ok(())
 }
 
 /// Package family name of the Microsoft "Windows App" (formerly Windows 365)
@@ -567,16 +799,67 @@ mod tests {
 
     #[test]
     fn authorize_url_uses_code_flow_and_native_redirect() {
-        let url = build_authorize_url("common", None, None);
+        let url = build_authorize_url("common", None, None, None);
         assert!(url.starts_with(
             "https://login.microsoftonline.com/common/oauth2/v2.0/authorize?"
         ));
         assert!(url.contains("response_type=code"));
         assert!(url.contains(&format!("client_id={DEFAULT_CLIENT_ID}")));
         // redirect_uri is URL-encoded.
-        assert!(url.contains("redirect_uri=https%3A%2F%2Flogin.microsoftonline.com%2Fcommon%2Foauth2%2Fnativeclient"));
+        assert!(url.contains(
+            "redirect_uri=https%3A%2F%2Flogin.microsoftonline.com%2Fcommon%2Foauth2%2Fnativeclient"
+        ));
         // wvd scope present (encoded).
         assert!(url.contains("www.wvd.microsoft.com"));
+        // No state requested → no state parameter.
+        assert!(!url.contains("state="));
+    }
+
+    #[test]
+    fn authorize_url_carries_state_when_given() {
+        let url = build_authorize_url("common", None, None, Some("abc123 4"));
+        assert!(url.contains("&state=abc123%204"));
+    }
+
+    #[test]
+    fn redirect_with_code_is_captured() {
+        let uri = format!("{}?code=ABC123&session_state=xyz", NATIVE_REDIRECT_URI);
+        assert_eq!(parse_auth_redirect(&uri), Some(Ok("ABC123".to_string())));
+    }
+
+    #[test]
+    fn redirect_with_error_is_reported() {
+        let uri = format!(
+            "{}?error=access_denied&error_description=user%20cancelled",
+            NATIVE_REDIRECT_URI
+        );
+        assert_eq!(
+            parse_auth_redirect(&uri),
+            Some(Err("access_denied: user cancelled".to_string()))
+        );
+    }
+
+    #[test]
+    fn login_pages_are_not_treated_as_redirect() {
+        assert_eq!(
+            parse_auth_redirect("https://login.microsoftonline.com/common/login"),
+            None
+        );
+        // The bare redirect URI with no query is not yet a result.
+        assert_eq!(parse_auth_redirect(NATIVE_REDIRECT_URI), None);
+    }
+
+    #[test]
+    fn query_param_reads_state() {
+        let uri = format!("{}?code=x&state=s%20t", NATIVE_REDIRECT_URI);
+        assert_eq!(query_param(&uri, "state").as_deref(), Some("s t"));
+        assert_eq!(query_param(&uri, "code").as_deref(), Some("x"));
+        assert_eq!(query_param(&uri, "missing"), None);
+    }
+
+    #[test]
+    fn url_decode_handles_percent_and_plus() {
+        assert_eq!(url_decode("a%20b+c%2Fd"), "a b c/d");
     }
 
     #[test]
@@ -585,6 +868,53 @@ mod tests {
         // of {"preferred_username":"nick@contoso.com"} (no padding).
         let payload = "eyJwcmVmZXJyZWRfdXNlcm5hbWUiOiJuaWNrQGNvbnRvc28uY29tIn0";
         let jwt = format!("aaa.{payload}.bbb");
-        assert_eq!(parse_id_token_upn(&jwt).as_deref(), Some("nick@contoso.com"));
+        assert_eq!(
+            parse_id_token_upn(&jwt).as_deref(),
+            Some("nick@contoso.com")
+        );
+    }
+
+    #[test]
+    fn token_tenant_reads_tid_claim() {
+        // Payload base64url of {"tid":"9188040d-1c1c-4c2d-8ab7-2e5e0f123456"}
+        let payload = "eyJ0aWQiOiI5MTg4MDQwZC0xYzFjLTRjMmQtOGFiNy0yZTVlMGYxMjM0NTYifQ";
+        let jwt = format!("aaa.{payload}.bbb");
+        assert_eq!(
+            token_tenant(&jwt).as_deref(),
+            Some("9188040d-1c1c-4c2d-8ab7-2e5e0f123456")
+        );
+        assert_eq!(token_tenant("not-a-jwt"), None);
+    }
+
+    #[test]
+    fn rdp_payload_validation_rejects_html_and_empty() {
+        let rdp = "screen mode id:i:2\nfull address:s:gw\nresourceprovider:s:arm\n";
+        assert!(looks_like_rdp(rdp).is_ok());
+        assert!(looks_like_rdp("<html><body>login</body></html>").is_err());
+        assert!(looks_like_rdp("just some text").is_err());
+    }
+
+    #[test]
+    fn tokenless_retry_only_for_microsoft_https_hosts() {
+        assert!(is_microsoft_avd_host(
+            "https://rdweb.wvd.microsoft.com/api/arm/v2/x.rdp?sig=secret"
+        ));
+        assert!(is_microsoft_avd_host("https://rdweb-eu.wvd.microsoft.com/x.rdp"));
+        assert!(!is_microsoft_avd_host("https://evil.example.com/x.rdp"));
+        assert!(!is_microsoft_avd_host("http://rdweb.wvd.microsoft.com/x.rdp"));
+    }
+
+    #[test]
+    fn feed_url_envelope_extracted() {
+        assert_eq!(
+            extract_feed_url(
+                "{\"FeedUrl\":\"https://rdweb.wvd.microsoft.com/api/arm/feeddiscovery/a/b\"}"
+            )
+            .as_deref(),
+            Some("https://rdweb.wvd.microsoft.com/api/arm/feeddiscovery/a/b")
+        );
+        // A feed document itself (not an envelope) is not followed.
+        assert_eq!(extract_feed_url("<?xml version=\"1.0\"?><ResourceCollection/>"), None);
+        assert_eq!(extract_feed_url("{\"error\":\"x\"}"), None);
     }
 }

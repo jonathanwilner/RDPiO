@@ -14,12 +14,12 @@ use std::sync::{mpsc, Mutex};
 use std::time::Duration;
 
 use webview2_com::{
+    CreateCoreWebView2ControllerCompletedHandler, CreateCoreWebView2EnvironmentCompletedHandler,
     Microsoft::Web::WebView2::Win32::{
         CreateCoreWebView2EnvironmentWithOptions, ICoreWebView2, ICoreWebView2Controller,
         ICoreWebView2Environment,
     },
-    CreateCoreWebView2ControllerCompletedHandler,
-    CreateCoreWebView2EnvironmentCompletedHandler, NavigationStartingEventHandler,
+    NavigationStartingEventHandler,
 };
 use windows::core::{Error as WindowsError, HSTRING, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{CloseHandle, HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
@@ -33,7 +33,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WINDOW_EX_STYLE, WM_CLOSE, WM_DESTROY, WM_QUIT, WNDCLASSW, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
 };
 
-use crate::w365::{AccessToken, AuthError};
+use crate::w365::{parse_auth_redirect, AccessToken, AuthError};
+// `parse_auth_redirect` lives in `w365` so the Linux system-browser flow
+// shares the exact same redirect parsing.
 
 const CLASS_NAME: &str = "rdpioWebViewAuth";
 const WINDOW_TITLE: &str = "Sign in to Windows 365";
@@ -84,7 +86,7 @@ pub fn authenticate(
     tenant: &str,
     client_id: Option<&str>,
 ) -> Result<AccessToken, WebViewAuthError> {
-    let authorize_url = crate::w365::build_authorize_url(tenant, client_id, None);
+    let authorize_url = crate::w365::build_authorize_url(tenant, client_id, None, None);
     tracing::info!(%authorize_url, "opening WebView2 login panel (authorization-code flow)");
 
     // The NavigationStarting handler delivers the captured authorization code
@@ -129,64 +131,6 @@ pub fn authenticate(
     // already torn down; this is a plain HTTPS round-trip).
     let code = code_result?;
     crate::w365::exchange_auth_code(tenant, client_id, None, &code).map_err(WebViewAuthError::Auth)
-}
-
-/// Parse an intercepted navigation. Returns `Some(Ok(code))` when `uri` is the
-/// native-client redirect carrying an authorization `code`, `Some(Err(msg))`
-/// when it carries an OAuth `error`, and `None` for any other navigation (the
-/// login pages themselves).
-fn parse_auth_redirect(uri: &str) -> Option<Result<String, String>> {
-    let query = uri.strip_prefix(crate::w365::NATIVE_REDIRECT_URI)?;
-    // The redirect is `<redirect_uri>?code=...` (or `?error=...`). Tolerate an
-    // exact match with no query as "not yet".
-    let query = query.strip_prefix('?').or_else(|| query.strip_prefix('#'))?;
-    let mut code = None;
-    let mut error = None;
-    for pair in query.split('&') {
-        let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
-        match k {
-            "code" => code = Some(url_decode(v)),
-            "error" => error = Some(url_decode(v)),
-            "error_description" if error.is_some() => {
-                error = Some(format!("{}: {}", error.unwrap(), url_decode(v)));
-            }
-            _ => {}
-        }
-    }
-    if let Some(c) = code {
-        Some(Ok(c))
-    } else { error.map(Err) }
-}
-
-/// Minimal `application/x-www-form-urlencoded` decoder for redirect query values.
-fn url_decode(s: &str) -> String {
-    let bytes = s.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'%' if i + 2 < bytes.len() => {
-                let hi = (bytes[i + 1] as char).to_digit(16);
-                let lo = (bytes[i + 2] as char).to_digit(16);
-                if let (Some(hi), Some(lo)) = (hi, lo) {
-                    out.push((hi * 16 + lo) as u8);
-                    i += 3;
-                    continue;
-                }
-                out.push(b'%');
-                i += 1;
-            }
-            b'+' => {
-                out.push(b' ');
-                i += 1;
-            }
-            b => {
-                out.push(b);
-                i += 1;
-            }
-        }
-    }
-    String::from_utf8_lossy(&out).into_owned()
 }
 
 fn create_host_window() -> Result<HWND, WebViewAuthError> {
@@ -265,28 +209,24 @@ fn init_webview(
             None,
             None,
             None,
-            &CreateCoreWebView2EnvironmentCompletedHandler::create(Box::new(
-                move |_, env| {
-                    let env = match env {
-                        Some(env) => env,
-                        None => {
-                            let err = WebViewAuthError::WebView2(
-                                "WebView2 runtime failed to create environment".into(),
-                            );
-                            tracing::error!(%err);
-                            signal_ready(&ready_tx, ready_event, Err(err));
-                            return Ok(());
-                        }
-                    };
-                    tracing::info!("WebView2 environment created");
-                    if let Err(e) =
-                        init_controller(env, hwnd, &url, code_tx, ready_tx, ready_event)
-                    {
-                        tracing::error!(error = %e, "failed to create WebView2 controller");
+            &CreateCoreWebView2EnvironmentCompletedHandler::create(Box::new(move |_, env| {
+                let env = match env {
+                    Some(env) => env,
+                    None => {
+                        let err = WebViewAuthError::WebView2(
+                            "WebView2 runtime failed to create environment".into(),
+                        );
+                        tracing::error!(%err);
+                        signal_ready(&ready_tx, ready_event, Err(err));
+                        return Ok(());
                     }
-                    Ok(())
-                },
-            )),
+                };
+                tracing::info!("WebView2 environment created");
+                if let Err(e) = init_controller(env, hwnd, &url, code_tx, ready_tx, ready_event) {
+                    tracing::error!(error = %e, "failed to create WebView2 controller");
+                }
+                Ok(())
+            })),
         )
     };
     if let Err(e) = create_result {
@@ -327,12 +267,7 @@ fn pump_init_messages(
 
         let timeout = (deadline - now).as_millis().min(100) as u32;
         unsafe {
-            MsgWaitForMultipleObjectsEx(
-                Some(&handles),
-                timeout,
-                QS_ALLINPUT,
-                MWMO_INPUTAVAILABLE,
-            );
+            MsgWaitForMultipleObjectsEx(Some(&handles), timeout, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
 
             let mut msg = MSG::default();
             while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
@@ -512,38 +447,4 @@ fn pump_messages(
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn redirect_with_code_is_captured() {
-        let uri = format!("{}?code=ABC123&session_state=xyz", crate::w365::NATIVE_REDIRECT_URI);
-        assert_eq!(parse_auth_redirect(&uri), Some(Ok("ABC123".to_string())));
-    }
-
-    #[test]
-    fn redirect_with_error_is_reported() {
-        let uri = format!(
-            "{}?error=access_denied&error_description=user%20cancelled",
-            crate::w365::NATIVE_REDIRECT_URI
-        );
-        assert_eq!(
-            parse_auth_redirect(&uri),
-            Some(Err("access_denied: user cancelled".to_string()))
-        );
-    }
-
-    #[test]
-    fn login_pages_are_not_treated_as_redirect() {
-        assert_eq!(parse_auth_redirect("https://login.microsoftonline.com/common/login"), None);
-        // The bare redirect URI with no query is not yet a result.
-        assert_eq!(parse_auth_redirect(crate::w365::NATIVE_REDIRECT_URI), None);
-    }
-
-    #[test]
-    fn url_decode_handles_percent_and_plus() {
-        assert_eq!(url_decode("a%20b+c%2Fd"), "a b c/d");
-    }
-}
-
+// The redirect-parsing tests moved to `w365` together with the functions.

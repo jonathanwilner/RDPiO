@@ -22,6 +22,11 @@ pub struct FeedEntry {
     pub use_redirection_gateway: bool,
     /// Raw `.rdp` file contents, if the feed provides them inline or by URL.
     pub rdp_file: Option<String>,
+    /// URL of the resource's signed `.rdp` connection file (MS-TSWP
+    /// `HostingTerminalServer/ResourceFile` with extension `.rdp`). Downloading
+    /// this gives Microsoft's own current connection payload — never synthesize
+    /// one. `None` for feeds that do not publish resource files.
+    pub rdp_url: Option<String>,
     // Windows 365 / AVD specific fields.
     /// The Azure resource id of the Cloud PC or host pool (W365 feed).
     pub resource_id: String,
@@ -47,6 +52,7 @@ impl Default for FeedEntry {
             load_balance_info: None,
             use_redirection_gateway: false,
             rdp_file: None,
+            rdp_url: None,
             resource_id: String::new(),
             tenant_id: String::new(),
             session_id: String::new(),
@@ -93,33 +99,70 @@ pub fn parse(body: &str) -> Result<Vec<FeedEntry>, FeedError> {
 }
 
 fn parse_xml(xml: &str) -> Result<Vec<FeedEntry>, FeedError> {
+    // A real XML parser (roxmltree) is used: MS-TSWP 2.x feeds describe each
+    // `<Resource>` with attributes (`ID`, `Alias`, `Title`, `Type`) and nest the
+    // connection payload under `HostingTerminalServers/HostingTerminalServer/
+    // ResourceFile`, while the legacy RDWeb format used child elements. The old
+    // string-splitting parser could not represent either robustly (it also
+    // matched `<ResourceCollection`/`<ResourceFile` as `<Resource`).
+    let doc = roxmltree::Document::parse(xml).map_err(|e| FeedError::Parse(e.to_string()))?;
+
     let mut entries = Vec::new();
-    for resource in split_elements(xml, "Resource") {
+    for node in doc.descendants().filter(|n| n.has_tag_name("Resource")) {
         let mut entry = FeedEntry::default();
-        entry.id = text_of(&resource, "ID").unwrap_or_default();
-        entry.display_name = text_of(&resource, "Name").unwrap_or_default();
-        entry.address = text_of(&resource, "HostName")
-            .or_else(|| text_of(&resource, "Address"))
+        // MS-TSWP 2.x: identifiers ride on attributes.
+        entry.id = node.attribute("ID").unwrap_or_default().to_string();
+        entry.display_name = node
+            .attribute("Title")
+            .filter(|t| !t.is_empty())
+            .or_else(|| node.attribute("Alias"))
+            .unwrap_or_default()
+            .to_string();
+        // Legacy RDWeb: the same data as child elements.
+        if entry.id.is_empty() {
+            entry.id = text_of(node, "ID").unwrap_or_default();
+        }
+        if entry.display_name.is_empty() {
+            entry.display_name = text_of(node, "Name").unwrap_or_default();
+        }
+        entry.address = text_of(node, "HostName")
+            .or_else(|| text_of(node, "Address"))
             .unwrap_or_default();
-        entry.gateway = text_of(&resource, "Gateway");
-        entry.load_balance_info = text_of(&resource, "LoadBalanceInfo").map(|s| s.into_bytes());
+        entry.gateway = text_of(node, "Gateway");
+        entry.load_balance_info = text_of(node, "LoadBalanceInfo").map(|s| s.into_bytes());
         entry.use_redirection_gateway =
-            text_of(&resource, "UseRedirectionServer").as_deref() == Some("true");
-        entry.rdp_file = text_of(&resource, "RdpFile");
+            text_of(node, "UseRedirectionServer").as_deref() == Some("true");
+        entry.rdp_file = text_of(node, "RdpFile");
+
+        // MS-TSWP: the signed `.rdp` connection resource, one per hosting
+        // terminal server. Take the first `.rdp` ResourceFile (an AVD desktop
+        // has exactly one; RemoteApp feeds may add other extensions later).
+        entry.rdp_url = node
+            .descendants()
+            .filter(|n| n.has_tag_name("ResourceFile"))
+            .find(|n| {
+                n.attribute("FileExtension")
+                    .map(|e| e.eq_ignore_ascii_case(".rdp"))
+                    .unwrap_or(false)
+            })
+            .and_then(|n| n.attribute("URL"))
+            .filter(|u| !u.is_empty())
+            .map(str::to_string);
 
         // W365 / AVD fields may appear in XML feeds too.
-        entry.resource_id = text_of(&resource, "ResourceId").unwrap_or_default();
-        entry.tenant_id = text_of(&resource, "TenantId").unwrap_or_default();
-        entry.session_id = text_of(&resource, "SessionId").unwrap_or_default();
-        entry.gateway_fqdn = text_of(&resource, "GatewayFqdn").unwrap_or_default();
-        entry.use_reverse_connect =
-            text_of(&resource, "UseReverseConnect").as_deref() == Some("true");
+        entry.resource_id = text_of(node, "ResourceId").unwrap_or_default();
+        entry.tenant_id = text_of(node, "TenantId").unwrap_or_default();
+        entry.session_id = text_of(node, "SessionId").unwrap_or_default();
+        entry.gateway_fqdn = text_of(node, "GatewayFqdn").unwrap_or_default();
+        entry.use_reverse_connect = text_of(node, "UseReverseConnect").as_deref() == Some("true");
 
         let (host, port) = split_host_port(&entry.address, 3389);
         entry.hostname = host;
         entry.port = port;
 
-        if !entry.hostname.is_empty() || !entry.gateway_fqdn.is_empty() {
+        // A TSWP entry is usable through its resource file even without a
+        // direct hostname (AVD: everything is brokered through the ARM gateway).
+        if !entry.hostname.is_empty() || !entry.gateway_fqdn.is_empty() || entry.rdp_url.is_some() {
             entries.push(entry);
         }
     }
@@ -145,7 +188,9 @@ fn parse_json(json: &str) -> Result<Vec<FeedEntry>, FeedError> {
         _ => return Err(FeedError::Parse("expected array or object".into())),
     };
     for item in array {
-        let obj = item.as_object().ok_or_else(|| FeedError::Parse("expected object".into()))?;
+        let obj = item
+            .as_object()
+            .ok_or_else(|| FeedError::Parse("expected object".into()))?;
         let mut entry = FeedEntry::default();
         entry.id = string_field(obj, "id");
         entry.display_name = string_field(obj, "displayName");
@@ -153,7 +198,10 @@ fn parse_json(json: &str) -> Result<Vec<FeedEntry>, FeedError> {
         if entry.address.is_empty() {
             entry.address = string_field(obj, "hostname");
         }
-        entry.gateway = obj.get("gateway").and_then(|v| v.as_str()).map(String::from);
+        entry.gateway = obj
+            .get("gateway")
+            .and_then(|v| v.as_str())
+            .map(String::from);
         entry.load_balance_info = obj
             .get("loadBalanceInfo")
             .and_then(|v| v.as_str())
@@ -162,7 +210,10 @@ fn parse_json(json: &str) -> Result<Vec<FeedEntry>, FeedError> {
             .get("useRedirectionServer")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
-        entry.rdp_file = obj.get("rdpFile").and_then(|v| v.as_str()).map(String::from);
+        entry.rdp_file = obj
+            .get("rdpFile")
+            .and_then(|v| v.as_str())
+            .map(String::from);
 
         // W365 / AVD specific fields.
         entry.resource_id = string_field(obj, "resourceId");
@@ -285,30 +336,12 @@ fn split_host_port(addr: &str, default_port: u16) -> (String, u16) {
     (addr.to_string(), default_port)
 }
 
-fn split_elements(xml: &str, tag: &str) -> Vec<String> {
-    let open = format!("<{tag}");
-    let close = format!("</{tag}>");
-    let mut out = Vec::new();
-    let mut rest = xml;
-    while let Some(start) = rest.find(&open) {
-        let from = &rest[start..];
-        if let Some(end) = from.find(&close) {
-            let end_off = end + close.len();
-            out.push(from[..end_off].to_string());
-            rest = &from[end_off..];
-        } else {
-            break;
-        }
-    }
-    out
-}
-
-fn text_of(xml: &str, tag: &str) -> Option<String> {
-    let open = format!("<{tag}>");
-    let close = format!("</{tag}>");
-    let start = xml.find(&open)? + open.len();
-    let end = xml[start..].find(&close)?;
-    Some(xml[start..start + end].to_string())
+/// Text of the first direct child element `tag` of `node` (legacy RDWeb shape).
+fn text_of(node: roxmltree::Node<'_, '_>, tag: &str) -> Option<String> {
+    node.children()
+        .find(|c| c.has_tag_name(tag))
+        .and_then(|c| c.text())
+        .map(str::to_string)
 }
 
 #[cfg(test)]
@@ -372,6 +405,75 @@ mod tests {
     #[test]
     fn empty_feed_errors() {
         assert!(parse("<RDWeb></RDWeb>").is_err());
+    }
+
+    #[test]
+    fn tswp_avd_feed_parses_resource_attributes_and_rdp_url() {
+        // Real AVD shape (MS-TSWP 2.2.2): `Resource` describes the desktop with
+        // attributes; the connection payload is the `.rdp` `ResourceFile` under
+        // `HostingTerminalServer`. No direct hostname exists — the ARM gateway
+        // brokers the connection, so `rdp_url` is the actionable output.
+        let xml = r#"<?xml version="1.0" encoding="utf-8"?>
+<ResourceCollection PublishedDate="2024-01-01T00:00:00.000Z" SchemaVersion="2.0">
+  <Publisher LastUpdated="2024-01-01T00:00:00.000Z" ID="6dfd7d72-b06f-4f27" Name="MS WVD" SupportsReconnect="true">
+    <Resources>
+      <Resource ID="6c7fa6ab-8f0d" Alias="SessionDesktop" Title="Session Desktop" LastUpdated="2024-01-01T00:00:00.000Z" Type="Desktop">
+        <HostingTerminalServers>
+          <HostingTerminalServer>
+            <TerminalServerRef Ref="rds-1"/>
+            <ResourceFile FileExtension=".rdp" URL="https://rdweb.wvd.microsoft.com/api/arm/v2/tenantinformationservices/Connections/discover/6c7fa6ab-8f0d.rdp"/>
+          </HostingTerminalServer>
+        </HostingTerminalServers>
+      </Resource>
+      <Resource ID="9c81cc2b-3e19" Alias="Calculator" Title="Calculator" Type="RemoteApp">
+        <HostingTerminalServers>
+          <HostingTerminalServer>
+            <TerminalServerRef Ref="rds-1"/>
+            <ResourceFile FileExtension=".rdp" URL="https://rdweb.wvd.microsoft.com/api/arm/v2/tenantinformationservices/Connections/discover/9c81cc2b-3e19.rdp"/>
+            <ResourceFile FileExtension=".msrcincident" URL="https://example/ignore.rdp.wrong"/>
+          </HostingTerminalServer>
+        </HostingTerminalServers>
+      </Resource>
+    </Resources>
+    <TerminalServers>
+      <TerminalServer ID="rds-1" Name="rds-abcdef.wvd.microsoft.com"/>
+    </TerminalServers>
+  </Publisher>
+</ResourceCollection>"#;
+        let entries = parse(xml).unwrap();
+        assert_eq!(entries.len(), 2);
+        let desktop = &entries[0];
+        assert_eq!(desktop.id, "6c7fa6ab-8f0d");
+        assert_eq!(desktop.display_name, "Session Desktop");
+        assert_eq!(
+            desktop.rdp_url.as_deref(),
+            Some("https://rdweb.wvd.microsoft.com/api/arm/v2/tenantinformationservices/Connections/discover/6c7fa6ab-8f0d.rdp")
+        );
+        // The RemoteApp entry is selected by its own resource file, not the
+        // desktop's (and non-.rdp extensions are ignored).
+        assert!(entries[1]
+            .rdp_url
+            .as_deref()
+            .unwrap()
+            .contains("9c81cc2b-3e19.rdp"));
+        // No direct address in a TSWP feed; the entry is still usable.
+        assert!(desktop.hostname.is_empty());
+    }
+
+    #[test]
+    fn tswp_url_entities_are_decoded() {
+        let xml = r#"<ResourceCollection><Publisher><Resources>
+          <Resource ID="a" Alias="d" Title="D" Type="Desktop">
+            <HostingTerminalServers><HostingTerminalServer>
+              <ResourceFile FileExtension=".rdp" URL="https://host/path?a=1&amp;b=2"/>
+            </HostingTerminalServer></HostingTerminalServers>
+          </Resource>
+        </Resources></Publisher></ResourceCollection>"#;
+        let entries = parse(xml).unwrap();
+        assert_eq!(
+            entries[0].rdp_url.as_deref(),
+            Some("https://host/path?a=1&b=2")
+        );
     }
 
     #[test]
