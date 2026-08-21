@@ -27,6 +27,7 @@ tungstenite.workspace = true
 url.workspace = true
 http.workspace = true
 mimalloc.workspace = true
+roxmltree.workspace = true
 
 [target.'cfg(not(windows))'.dependencies]
 # Linux/Unix TLS for the RDP Enhanced Security path (SChannel's counterpart).
@@ -34,6 +35,10 @@ mimalloc.workspace = true
 rustls = "0.23"
 rustls-pki-types = "1"
 webpki-roots = "0.26"
+# Secret Service (gnome-keyring & friends) storage for the W365 refresh token.
+# Pure-Rust (zbus/secret-service); falls back to a 0600 state file when no
+# Secret Service is available.
+keyring = "2"
 
 [target.'cfg(windows)'.dependencies]
 # Native Teams "Optimized" WebRTC engine (`--teams-native`): the portable

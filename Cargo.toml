@@ -40,6 +40,8 @@ byteorder = "1.5"
 bitflags = "2.6"
 wide = "0.7"
 ureq = { version = "2.10", features = ["json"] }
+# Proper XML parsing for MS-TSWP / RDWeb feed documents. Pure Rust, no deps.
+roxmltree = "0.20"
 # Allocator. The default on Windows is HeapAlloc, whose per-heap lock is
 # contended across our network / decode / UI threads, and the tile codecs
 # allocate a buffer per tile — hundreds per frame. mimalloc's per-thread free
