@@ -49,10 +49,31 @@ On a real Linux host, a plain `cargo build` works (gcc is standard, no space iss
   §4.2.4 NTLMv2 test vectors + a seal/unseal round-trip (no Windows APIs, no new
   external crates). NLA is a one-time connection handshake, off every per-frame
   path, so this does not affect streaming performance.
-- [ ] **Stage 4 — W365 on Linux.** Port the RDSTLS v3 credential (CNG AES/RSA/cert
-  → RustCrypto: `aes`, `cbc`, `rsa`, `x509-cert`), the token/password caches
-  (DPAPI → an encrypted file or libsecret), and auth (WebView2 → system browser +
-  loopback redirect).
+- [ ] **Stage 4 — W365 on Linux.** *Partially done via integration.* The
+  portable half of Stage 4 is complete: `w365.rs` (OAuth code/device flows,
+  refresh, ARM feed discovery, `.rdp` resource download) and the feed parser
+  now run on Linux, the token cache stores via the Secret Service with a `0600`
+  XDG-state file fallback, and the interactive sign-in uses the system browser
+  (`xdg-open` + paste-the-redirect, with OAuth `state` verification) instead of
+  WebView2. `rdpio --w365` on Linux is a **FreeRDP integration backend**:
+  rdpio discovers the workspace and downloads Microsoft's current signed
+  `.rdp`, then hands it to an upstream FreeRDP 3 client
+  (`/gateway:type:arm /sec:aad /dvc:rdpecam`), which owns the ARM gateway,
+  RDSAAD session auth, the interactive session, and webcam redirection through
+  its upstream MS-RDPECAM client (`CHANNEL_RDPECAM_CLIENT=ON`; the repo flake
+  builds one via `nix develop` / `nix build .#freerdp-ecam`). This is a
+  deliberate hand-off, not a port of rdpio's native W365 stack — porting
+  RDSTLS v3, the ARM broker tunnel, rendering and RDPECAM natively remains
+  future work tracked by the unchecked items below.
+  - [x] Portable W365 auth + feed + `.rdp` download (`w365.rs`, `feed.rs`,
+    `browser_auth.rs`, `token_cache.rs`).
+  - [x] FreeRDP session backend (`freerdp_backend.rs`): capability detection,
+    verbatim `.rdp` in a `0600` temp file, argv-vector launch, camera policy
+    (`--camera`/`--no-camera`), `--w365-doctor`.
+  - [ ] Port the RDSTLS v3 credential (CNG AES/RSA/cert → RustCrypto) for a
+    fully native session (not needed for the FreeRDP backend).
+  - [ ] Port the native reverse-connect/ARM tunnel (not needed for the FreeRDP
+    backend).
 - [ ] **Stage 5 — interactive client.** Rendering (D3D11 → `wgpu`), window/input
   (Win32 → `winit`), H.264 decode (Media Foundation → `ffmpeg`/VA-API), audio
   (WASAPI → `cpal`/PipeWire).

@@ -73,14 +73,50 @@ More recipes in [Run it](#run-it); every flag is listed under [Options](#options
 | Connect to a Windows host (TCP) | ✅ | ✅ |
 | TLS + NLA/CredSSP | ✅ (SChannel/SSPI) | ✅ (rustls + portable CredSSP) |
 | Protocol stack + codecs | ✅ | ✅ |
-| Window, input, GPU decode/present | ✅ | ⛔ not yet |
-| Drives, clipboard, audio, mic, camera, printer | ✅ | ⛔ not yet |
-| Windows 365 / AVD sign-in | ✅ | ⛔ not yet |
+| Window, input, GPU decode/present | ✅ | ⛔ not yet (W365 sessions use FreeRDP — below) |
+| Drives, clipboard, audio, mic, camera, printer | ✅ | via FreeRDP for W365 |
+| Windows 365 / AVD sign-in | ✅ | ✅ (discovery + native FreeRDP session; see below) |
 | Teams "Optimized" (WebRTC redirect) | ✅ | ⛔ not yet |
 
 Linux is a staged port: the protocol core is portable and already runs there.
 Rendering, input, and device backends are the remaining work — see
 [`PORTING.md`](PORTING.md).
+
+### Windows 365 on Linux (FreeRDP integration)
+
+`rdpio --w365` works on Linux as an **integration backend**: rdpio's own W365
+machinery signs you in and discovers your workspace, then the current signed
+`.rdp` resource from Microsoft is handed to an upstream **FreeRDP 3** client,
+which opens the native session window:
+
+```
+rdpio (Linux)                        FreeRDP 3 (upstream)
+───────────                          ────────────────────
+Entra ID sign-in (system browser)
+  → AVD ARM feed discovery
+  → download Microsoft's .rdp   ───► native interactive session window
+                                     (ARM gateway, RDSAAD, graphics,
+                                      input, audio, clipboard, resize)
+  webcam: /dev/videoN ─────────► RDPECAM (MS-RDPECAM) → Windows camera
+```
+
+- Windows keeps rdpio's **native** W365 backend (`--w365-backend native`).
+- Linux defaults to the FreeRDP backend (`--w365-backend freerdp`, default).
+- The first connection prompts for the Microsoft sign-in **twice inside
+  FreeRDP** (gateway token, then the session host token); rdpio's own token is
+  cached, so workspace discovery is silent on later runs.
+- Camera redirection uses FreeRDP's upstream MS-RDPECAM client and needs a
+  FreeRDP built with `CHANNEL_RDPECAM_CLIENT=ON` (upstream default is OFF).
+  The provided Nix flake builds one: `nix build .#freerdp-ecam` (or
+  `nix develop` for a dev shell with it). `rdpio --w365-doctor` checks it all.
+
+```bash
+rdpio --w365                     # sign in, pick a Cloud PC, launch FreeRDP
+rdpio --w365 --no-camera         # disable webcam redirection
+rdpio --w365 --camera            # require it (fails clearly if unsupported)
+rdpio --w365 --freerdp-arg /multimon
+rdpio --w365-doctor              # integration diagnostics
+```
 
 ## Run it
 
@@ -235,11 +271,16 @@ is silent — check the startup log if a flag seems to have no effect.
 | `--teams`, `--webrtc` | Teams "Optimized" A/V by hosting Microsoft's WebRTC add-in |
 | `--teams-native`, `--webrtc-native` | Teams "Optimized" through RDPiO's own WebRTC engine |
 
-**Windows 365 / AVD** *(Windows)*
+**Windows 365 / AVD** *(Windows: native backend; Linux: FreeRDP backend)*
 
 | Flag | Effect |
 | --- | --- |
-| `--w365` | Sign in to Windows 365 and pick a Cloud PC |
+| `--w365` | Sign in to Windows 365 and pick a Cloud PC. Windows: rdpio's native stack. Linux: rdpio discovers the workspace, downloads Microsoft's signed `.rdp`, and hands it to FreeRDP 3 |
+| `--w365-backend native\|freerdp` | Force the session backend (default: native on Windows, freerdp on Linux) |
+| `--camera` / `--no-camera` | (Linux) require / disable webcam redirection via FreeRDP's RDPECAM. Default: on when the FreeRDP build supports it and a camera exists |
+| `--freerdp-arg ARG` | (Linux) pass one extra FreeRDP flag verbatim; repeatable |
+| `--save-rdp PATH` | Save Microsoft's downloaded `.rdp` for diagnostics |
+| `--w365-doctor` | (Linux) check FreeRDP, RDPECAM, cameras, token cache, workspace |
 | `--feed URL` | Connect via a workspace feed URL |
 | `--rdp-file PATH` | Connect using a downloaded `.rdp` file |
 | `--tenant ID`, `--client-id ID` | Override the Entra tenant / app registration |
