@@ -79,6 +79,10 @@ fn cache_doc(tenant: &str, client_id: Option<&str>, token: &AccessToken) -> Stri
         "v": 1,
         "tenant": tenant,
         "client_id": client_id,
+        // The registration that minted this token — may differ from the
+        // requested `client_id` when the login was reused from the teams-cli
+        // cache. A later refresh must use it, or Entra rejects the grant.
+        "token_client_id": token.client_id,
         "refresh_token": token.refresh_token,
         "access_token": token.token,
         "expires_at": expires_at,
@@ -309,6 +313,19 @@ pub fn load_silent(tenant: &str, client_id: Option<&str>) -> Option<AccessToken>
         .get("username")
         .and_then(|v| v.as_str())
         .map(String::from);
+    // The registration that minted the cached token: the new `token_client_id`
+    // when present, else the doc's `client_id` (caches written before the
+    // teams-cli reuse existed only ever used the requested client).
+    let mint_client = doc
+        .get("token_client_id")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            doc.get("client_id")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+        })
+        .map(String::from);
     let expires_at = doc.get("expires_at").and_then(|v| v.as_u64()).unwrap_or(0);
     let refresh = doc.get("refresh_token").and_then(|v| v.as_str());
 
@@ -321,14 +338,18 @@ pub fn load_silent(tenant: &str, client_id: Option<&str>) -> Option<AccessToken>
                 refresh_token: refresh.map(String::from),
                 expires_in: Duration::from_secs(expires_at.saturating_sub(now_unix())),
                 username,
+                client_id: mint_client,
             });
         }
     }
 
     // Otherwise mint a fresh access token from the refresh token (silent).
+    // The grant must use the registration that minted the cached token —
+    // rdpio's AVD client for normal logins, the teams-cli registration for a
+    // login reused from teams-tui-go.
     let refresh = refresh?;
     tracing::info!("refreshing W365 access token from cached refresh token (no MFA)");
-    match w365::refresh_token(tenant, client_id, refresh) {
+    match w365::refresh_token(tenant, mint_client.as_deref(), None, refresh) {
         Ok(mut token) => {
             // Refresh responses may omit the id_token; keep the cached username.
             if token.username.is_none() {
@@ -364,12 +385,20 @@ pub fn clear(tenant: &str, client_id: Option<&str>) -> io::Result<()> {
 mod tests {
     use super::*;
 
+    // These tests mutate process-wide XDG env vars; serialize them (and keep
+    // them away from the teams_auth tests, which use different vars).
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    fn lock_env() -> std::sync::MutexGuard<'static, ()> {
+        ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
     fn token() -> AccessToken {
         AccessToken {
             token: "access-1".into(),
             refresh_token: Some("refresh-1".into()),
             expires_in: std::time::Duration::from_secs(3600),
             username: Some("nick@contoso.com".into()),
+            client_id: None,
         }
     }
 
@@ -390,6 +419,7 @@ mod tests {
     /// when unavailable in the test environment).
     #[test]
     fn file_fallback_round_trip() {
+        let _env = lock_env();
         let tmp = tempdir();
         std::env::set_var("XDG_STATE_HOME", &tmp);
         let (tenant, client_id) = ("roundtrip-tenant", None::<&str>);
@@ -416,6 +446,74 @@ mod tests {
         assert!(!path.is_file(), "cache removed");
         assert!(load_silent(tenant, client_id).is_none());
 
+        std::env::remove_var("XDG_STATE_HOME");
+    }
+
+    /// The minting registration survives the round trip and is what a later
+    /// silent refresh uses — the teams-cli-reused login must refresh with the
+    /// teams registration, not rdpio's AVD client.
+    #[test]
+    fn minted_client_id_round_trip() {
+        let _env = lock_env();
+        let tmp = tempdir();
+        std::env::set_var("XDG_STATE_HOME", &tmp);
+        let (tenant, client_id) = ("mint-tenant", None::<&str>);
+
+        let mut t = token();
+        t.client_id = Some("d3590ed6-52b3-4102-aeff-aad2292ab01c".into());
+        store(tenant, client_id, &t);
+
+        let path = tmp.join("rdpio").join(CACHE_FILE);
+        let doc: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            doc["token_client_id"].as_str(),
+            Some("d3590ed6-52b3-4102-aeff-aad2292ab01c")
+        );
+
+        // Cached access token still valid → returned with the minting client.
+        let cached = load_silent(tenant, client_id).expect("silent load");
+        assert_eq!(
+            cached.client_id.as_deref(),
+            Some("d3590ed6-52b3-4102-aeff-aad2292ab01c")
+        );
+
+        clear(tenant, client_id).unwrap();
+        std::env::remove_var("XDG_STATE_HOME");
+    }
+
+    /// Pre-`token_client_id` caches (v1 doc with only `client_id`) still load,
+    /// deriving the minting client from the legacy field.
+    #[test]
+    fn legacy_cache_without_minted_client() {
+        let _env = lock_env();
+        let tmp = tempdir();
+        std::env::set_var("XDG_STATE_HOME", &tmp);
+        let dir = tmp.join("rdpio");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(CACHE_FILE),
+            serde_json::json!({
+                "v": 1,
+                "tenant": "legacy",
+                "client_id": "a85cf173-4192-42f8-81fa-777a763e6e2c",
+                "access_token": "legacy-access",
+                "refresh_token": "legacy-refresh",
+                "expires_at": now_unix() + 3600,
+                "username": "nick@contoso.com"
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let cached = load_silent("legacy", None).expect("legacy cache loads");
+        assert_eq!(cached.token, "legacy-access");
+        assert_eq!(
+            cached.client_id.as_deref(),
+            Some("a85cf173-4192-42f8-81fa-777a763e6e2c")
+        );
+
+        clear("legacy", None).unwrap();
         std::env::remove_var("XDG_STATE_HOME");
     }
 }

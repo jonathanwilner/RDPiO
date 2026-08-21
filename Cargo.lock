@@ -2032,6 +2032,7 @@ dependencies = [
 name = "rdp-client"
 version = "0.0.1"
 dependencies = [
+ "base64",
  "http",
  "keyring",
  "mimalloc",
@@ -2047,6 +2048,7 @@ dependencies = [
  "rustls",
  "rustls-pki-types",
  "serde_json",
+ "sha2",
  "thiserror 1.0.69",
  "tracing",
  "tracing-subscriber",

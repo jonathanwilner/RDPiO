@@ -64,10 +64,13 @@ mod password_cache;
 // (DPAPI on Windows, Secret Service / 0600 state file on Linux).
 mod token_cache;
 
-// Linux W365 integration: system-browser sign-in glue and the FreeRDP
+// Linux W365 integration: system-browser sign-in glue (including the
+// teams-cli login reused read-only from teams-tui-go) and the FreeRDP
 // session handoff (see PORTING.md, Stage 4). Windows keeps its native backend.
 #[cfg(not(windows))]
 mod browser_auth;
+#[cfg(not(windows))]
+mod teams_auth;
 #[cfg(not(windows))]
 mod freerdp_backend;
 
@@ -576,29 +579,79 @@ fn run_w365_freerdp(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
         discover_and_fetch_rdp(args, &tenant)?
     };
 
+/// Resolve the Linux W365 interactive login flow. Precedence mirrors the rest
+/// of the CLI: explicit `--w365-auth` → `RDPIO_W365_AUTH` → teams-tui-go's
+/// `auth_flow` (its config drives its own CLI the same way) → `paste`.
+#[cfg(not(windows))]
+fn resolve_w365_auth_flow(args: &Args) -> String {
+    if let Some(flow) = args.w365_auth.as_deref() {
+        return flow.to_string();
+    }
+    if let Ok(env) = std::env::var("RDPIO_W365_AUTH") {
+        match env.trim().to_ascii_lowercase().as_str() {
+            "auto" | "browser" | "device" | "paste" => return env.trim().to_lowercase(),
+            other => tracing::warn!(flow = %other, "ignoring unknown RDPIO_W365_AUTH"),
+        }
+    }
+    match teams_auth::load_config() {
+        Ok(Some(cfg)) => match cfg.auth_flow.as_str() {
+            "browser" | "device" => cfg.auth_flow,
+            _ => "paste".into(),
+        },
+        _ => "paste".into(),
+    }
+}
+
 /// Authenticate and discover the workspace via the existing AVD machinery,
 /// then download Microsoft's current signed `.rdp` for the chosen resource.
 #[cfg(not(windows))]
 fn discover_and_fetch_rdp(args: &Args, tenant: &str) -> Result<String, Box<dyn std::error::Error>> {
     if args.w365_relogin {
-        let _ = token_cache::clear(&tenant, args.client_id.as_deref());
+        let _ = token_cache::clear(tenant, args.client_id.as_deref());
     }
 
-    // Reuse the cached refresh token when possible (no browser, no MFA); fall
-    // back to an interactive sign-in — the system browser on Linux (with a
-    // device-code escape hatch for headless setups).
+    // Reuse a cached token when possible (no browser, no MFA), then try the
+    // teams-cli login (read-only reuse of teams-tui-go's token cache), and
+    // only then fall back to an interactive flow.
     let token = match (!args.w365_relogin)
-        .then(|| token_cache::load_silent(&tenant, args.client_id.as_deref()))
+        .then(|| token_cache::load_silent(tenant, args.client_id.as_deref()))
         .flatten()
+        .or_else(|| {
+            if args.w365_relogin {
+                return None;
+            }
+            let seeded = teams_auth::seed_w365_token(tenant);
+            if let Some(t) = seeded.as_ref() {
+                // Cache in rdpio's own store so later runs skip even the
+                // teams seed step. Never writes to teams-tui-go's files.
+                token_cache::store(tenant, args.client_id.as_deref(), t);
+            }
+            seeded
+        })
     {
         Some(t) => t,
         None => {
-            let t = if args.w365_device_code {
-                w365::authenticate_device_code(&tenant, args.client_id.as_deref(), None)?
+            let flow = resolve_w365_auth_flow(args);
+            let teams_cfg = teams_auth::load_config().ok().flatten().unwrap_or_default();
+            let t = if args.w365_device_code || flow == "device" {
+                // Device-code grant — the AVD client has it disabled
+                // (AADSTS7000218), so use teams-tui-go's device-flow
+                // registration when its login is configured.
+                let device_client = teams_cfg.client_id;
+                tracing::info!(client = %device_client, "device-code sign-in");
+                w365::authenticate_device_code(tenant, Some(&device_client), None)?
+            } else if flow == "browser" {
+                // teams-cli browser login: PKCE + localhost loopback.
+                browser_auth::authenticate_loopback(
+                    tenant,
+                    &teams_cfg.browser_client_id,
+                    Some(&teams_cfg.browser_command),
+                )?
             } else {
-                browser_auth::authenticate(&tenant, args.client_id.as_deref())?
+                // AVD nativeclient paste flow (rdpio default without teams-cli).
+                browser_auth::authenticate(tenant, args.client_id.as_deref())?
             };
-            token_cache::store(&tenant, args.client_id.as_deref(), &t);
+            token_cache::store(tenant, args.client_id.as_deref(), &t);
             t
         }
     };
@@ -718,7 +771,44 @@ fn w365_doctor(args: &Args) {
     }
 
     let tenant = args.tenant.clone().unwrap_or_else(|| "common".into());
-    match token_cache::load_silent(&tenant, args.client_id.as_deref()) {
+
+    // teams-cli login status: config, token cache, and whether its refresh
+    // token can seed a W365 sign-in right now (silent — no browser).
+    let teams_seed = match teams_auth::load_config() {
+        Ok(Some(cfg)) => {
+            println!(
+                "  teams-cli login          ok (auth_flow={}, browser={})",
+                cfg.auth_flow, cfg.browser_command
+            );
+            match teams_auth::seed_w365_token(&tenant) {
+                Some(t) => {
+                    let who = t
+                        .username
+                        .clone()
+                        .or_else(|| w365::token_tenant(&t.token))
+                        .unwrap_or_else(|| tenant.clone());
+                    println!("  teams-cli token reuse   ok (silent W365 sign-in as {who})");
+                    Some(t)
+                }
+                None => {
+                    println!("  teams-cli token reuse   none (no cached teams login, or Entra refused it)");
+                    None
+                }
+            }
+        }
+        Ok(None) => {
+            println!("  teams-cli login          none (no teams-tui-go config; using rdpio's own login)");
+            None
+        }
+        Err(e) => {
+            println!("  teams-cli login          FAILED ({e})");
+            None
+        }
+    };
+
+    // One workspace check with whichever silent token is available: the rdpio
+    // cache first, then the teams-cli seed.
+    match token_cache::load_silent(&tenant, args.client_id.as_deref()).or(teams_seed) {
         Some(t) => {
             let who = t
                 .username
@@ -1049,6 +1139,11 @@ struct Args {
     /// Fall back to the terminal/device-code login prompt instead of the WebView2
     /// login panel (`--w365-device-code`). Useful when WebView2 is unavailable.
     w365_device_code: bool,
+    /// Linux W365 interactive login flow (`--w365-auth auto|browser|device|paste`).
+    /// `auto` (default) reuses the teams-cli login when teams-tui-go is
+    /// configured on this machine, and otherwise falls back to the AVD
+    /// nativeclient paste flow.
+    w365_auth: Option<String>,
     /// Force a fresh W365 sign-in (`--w365-relogin`), discarding the cached
     /// refresh token. Use this to switch accounts or recover from a bad cache.
     w365_relogin: bool,
@@ -1135,6 +1230,7 @@ impl Args {
             feed: None,
             w365: false,
             w365_device_code: false,
+            w365_auth: None,
             w365_relogin: false,
             forget_password: false,
             tenant: None,
@@ -1275,6 +1371,19 @@ impl Args {
                 "--feed" => args.feed = it.next(),
                 "--w365" => args.w365 = true,
                 "--w365-device-code" => args.w365_device_code = true,
+                "--w365-auth" => {
+                    if let Some(v) = it.next() {
+                        match v.trim().to_ascii_lowercase().as_str() {
+                            "auto" | "browser" | "device" | "paste" => {
+                                args.w365_auth = Some(v.trim().to_ascii_lowercase());
+                            }
+                            other => tracing::warn!(
+                                flow = %other,
+                                "unknown --w365-auth (expected auto|browser|device|paste); using auto"
+                            ),
+                        }
+                    }
+                }
                 "--w365-relogin" | "--w365-logout" => args.w365_relogin = true,
                 "--w365-doctor" => args.w365_doctor = true,
                 "--w365-backend" => {
@@ -1440,6 +1549,9 @@ WINDOWS 365 / CLOUD PC
                            discovers the workspace, downloads Microsoft's signed
                            .rdp, and hands it to FreeRDP 3 (see PORTING.md).
     --w365-device-code     Use device-code sign-in (no local browser).
+    --w365-auth <FLOW>     auto|browser|device|paste. Default auto: reuse the
+                           teams-cli login (teams-tui-go token cache + its
+                           browser/device flows); paste is the AVD client flow.
     --w365-relogin         Force a fresh sign-in, discarding cached tokens.
     --w365-backend <B>     native|freerdp. Default: native on Windows,
                            freerdp on Linux (Linux W365 only).

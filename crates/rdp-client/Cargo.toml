@@ -39,6 +39,10 @@ webpki-roots = "0.26"
 # Pure-Rust (zbus/secret-service); falls back to a 0600 state file when no
 # Secret Service is available.
 keyring = "2"
+# PKCE (RFC 7636) for the teams-cli browser login. Both are already in the
+# workspace tree via rdp-crypto; versions track it.
+sha2.workspace = true
+base64.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 # Native Teams "Optimized" WebRTC engine (`--teams-native`): the portable

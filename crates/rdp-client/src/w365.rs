@@ -8,7 +8,6 @@
 //! Microsoft identity platform. It is intentionally synchronous so it fits the
 //! existing CLI/GUI startup flow without pulling in an async runtime.
 
-use std::collections::HashMap;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -28,7 +27,6 @@ const DEFAULT_SCOPE: &str = "https://www.wvd.microsoft.com/.default offline_acce
 #[derive(Debug, Clone)]
 pub struct AccessToken {
     pub token: String,
-    #[allow(dead_code)]
     pub refresh_token: Option<String>,
     #[allow(dead_code)]
     pub expires_in: Duration,
@@ -36,6 +34,12 @@ pub struct AccessToken {
     /// scope (`openid profile`) was requested. Used to default the RDSTLS logon
     /// username so the user need not pass `--user`.
     pub username: Option<String>,
+    /// The app registration that actually minted this token (the `client_id`
+    /// sent to the token endpoint). Tokens can be acquired through different
+    /// registrations (rdpio's AVD client, or the teams-cli login reused via
+    /// [`crate::teams_auth`]); a later refresh-token grant must use the same
+    /// one or Entra rejects it. Mirrors teams-cli's `TokenResponse.ClientID`.
+    pub client_id: Option<String>,
 }
 
 /// In-flight OAuth2 device-code flow. The caller displays `verification_uri`
@@ -117,6 +121,7 @@ impl DeviceCodeFlow {
             refresh_token,
             expires_in: Duration::from_secs(expires_in),
             username: token_resp["id_token"].as_str().and_then(parse_id_token_upn),
+            client_id: Some(self.client_id.clone()),
         }))
     }
 
@@ -188,9 +193,7 @@ pub fn start_device_code_flow(
     let client_id = client_id.unwrap_or(DEFAULT_CLIENT_ID).to_string();
     let scope = scope.unwrap_or(DEFAULT_SCOPE).to_string();
 
-    let device_url = format!(
-        "https://login.microsoftonline.com/{tenant}/oauth2/v2.0/devicecode"
-    );
+    let device_url = format!("https://login.microsoftonline.com/{tenant}/oauth2/v2.0/devicecode");
 
     tracing::info!(%device_url, %client_id, %scope, "requesting OAuth2 device code");
 
@@ -252,7 +255,7 @@ fn form_encode(items: &[(&str, &str)]) -> String {
         .join("&")
 }
 
-fn url_encode(s: &str) -> String {
+pub(crate) fn url_encode(s: &str) -> String {
     let mut out = String::new();
     for b in s.bytes() {
         match b {
@@ -265,30 +268,39 @@ fn url_encode(s: &str) -> String {
     out
 }
 
+/// The authorization-code scope used by every rdpio flow (feed token plus
+/// `id_token` and refresh token). Shared with the loopback browser flow.
+pub(crate) const AUTH_CODE_SCOPE: &str =
+    "https://www.wvd.microsoft.com/.default openid profile offline_access";
+
 /// Refresh an access token with the refresh token, if available.
-#[allow(dead_code)]
+///
+/// `scope` is forwarded to the token endpoint when given; omitted it means
+/// "the scopes this refresh token was originally granted", which is what
+/// rdpio's own cache wants. Cross-registration reuse (the teams-cli login)
+/// must pass the W365 scope explicitly so Entra mints a `www.wvd.microsoft.com`
+/// audience instead of the originally-granted Microsoft Graph one.
 pub fn refresh_token(
     tenant: &str,
     client_id: Option<&str>,
+    scope: Option<&str>,
     refresh: &str,
 ) -> Result<AccessToken, AuthError> {
     let client_id = client_id.unwrap_or(DEFAULT_CLIENT_ID);
-    let token_url = format!(
-        "https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token"
-    );
+    let token_url = format!("https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token");
 
-    let mut body = HashMap::new();
-    body.insert("grant_type", "refresh_token");
-    body.insert("client_id", client_id);
-    body.insert("refresh_token", refresh);
+    let mut form = vec![
+        ("grant_type", "refresh_token"),
+        ("client_id", client_id),
+        ("refresh_token", refresh),
+    ];
+    if let Some(scope) = scope {
+        form.push(("scope", scope));
+    }
 
     let resp: serde_json::Value = ureq::post(&token_url)
         .set("Content-Type", "application/x-www-form-urlencoded")
-        .send_string(&body
-            .iter()
-            .map(|(k, v)| format!("{}={}", url_encode(k), url_encode(v)))
-            .collect::<Vec<_>>()
-            .join("&"))?
+        .send_string(&form_encode(&form))?
         .into_json()?;
 
     if let Some(err) = resp.get("error") {
@@ -303,6 +315,7 @@ pub fn refresh_token(
         refresh_token: resp["refresh_token"].as_str().map(String::from),
         expires_in: Duration::from_secs(resp["expires_in"].as_u64().unwrap_or(3600)),
         username: resp["id_token"].as_str().and_then(parse_id_token_upn),
+        client_id: Some(client_id.to_string()),
     })
 }
 
@@ -316,16 +329,16 @@ pub fn refresh_token(
 // login page is shown in an embedded WebView, the browser is redirected to the
 // `nativeclient` URL carrying `?code=...`, and that code is exchanged for a
 // token. No client secret and no PKCE — exactly as FreeRDP's `client.c` does.
+//
+// Tenants whose Conditional Access blocks both of those (e.g. device-code
+// error 53003) can sign in through the teams-cli login instead (see
+// [`crate::teams_auth`]): the PKCE + localhost-loopback browser flow that
+// teams-tui-go uses, plus silent reuse of its token cache.
 
 /// Native-client redirect URI registered for `DEFAULT_CLIENT_ID`. AAD redirects
 /// the browser here with the authorization code; the WebView intercepts it.
 pub const NATIVE_REDIRECT_URI: &str =
     "https://login.microsoftonline.com/common/oauth2/nativeclient";
-/// Scope for the authorization-code flow. `openid profile` yield an `id_token`
-/// (so we can default the logon username); `offline_access` yields a refresh
-/// token. Matches FreeRDP's `GatewayAvdScope` default.
-const AUTH_CODE_SCOPE: &str =
-    "https://www.wvd.microsoft.com/.default openid profile offline_access";
 
 /// Build the authorization-code request URL to load in the login WebView.
 /// `state` is echoed back on the redirect; pass one when the caller can
@@ -360,22 +373,41 @@ pub fn exchange_auth_code(
     scope: Option<&str>,
     code: &str,
 ) -> Result<AccessToken, AuthError> {
+    exchange_auth_code_full(tenant, client_id, scope, code, NATIVE_REDIRECT_URI, None)
+}
+
+/// Exchange an authorization `code` for tokens against an arbitrary redirect
+/// URI, optionally proving a PKCE `code_verifier` (RFC 7636). This is the
+/// general form used by the localhost-loopback browser flow; the plain
+/// [`exchange_auth_code`] keeps the FreeRDP-compatible nativeclient shape.
+pub fn exchange_auth_code_full(
+    tenant: &str,
+    client_id: Option<&str>,
+    scope: Option<&str>,
+    code: &str,
+    redirect_uri: &str,
+    code_verifier: Option<&str>,
+) -> Result<AccessToken, AuthError> {
     let client_id = client_id.unwrap_or(DEFAULT_CLIENT_ID);
     let scope = scope.unwrap_or(AUTH_CODE_SCOPE);
-    let token_url =
-        format!("https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token");
+    let token_url = format!("https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token");
 
     tracing::info!(%token_url, "exchanging authorization code for token");
 
+    let mut form = vec![
+        ("grant_type", "authorization_code"),
+        ("code", code),
+        ("client_id", client_id),
+        ("scope", scope),
+        ("redirect_uri", redirect_uri),
+    ];
+    if let Some(verifier) = code_verifier {
+        form.push(("code_verifier", verifier));
+    }
+
     let http_resp = ureq::post(&token_url)
         .set("Content-Type", "application/x-www-form-urlencoded")
-        .send_string(&form_encode(&[
-            ("grant_type", "authorization_code"),
-            ("code", code),
-            ("client_id", client_id),
-            ("scope", scope),
-            ("redirect_uri", NATIVE_REDIRECT_URI),
-        ]));
+        .send_string(&form_encode(&form));
 
     let resp: serde_json::Value = match http_resp {
         Ok(r) => r.into_json()?,
@@ -404,6 +436,7 @@ pub fn exchange_auth_code(
         refresh_token: resp["refresh_token"].as_str().map(String::from),
         expires_in: Duration::from_secs(resp["expires_in"].as_u64().unwrap_or(3600)),
         username: resp["id_token"].as_str().and_then(parse_id_token_upn),
+        client_id: Some(client_id.to_string()),
     })
 }
 
@@ -453,7 +486,6 @@ pub fn query_param(uri: &str, key: &str) -> Option<String> {
     None
 }
 
-/// Minimal `application/x-www-form-urlencoded` decoder for redirect query values.
 pub fn url_decode(s: &str) -> String {
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
@@ -738,7 +770,9 @@ pub fn discover_cached_cloud_pcs() -> Vec<crate::feed::FeedEntry> {
             Err(_) if raw.contains("resourceprovider") => Some(raw.clone()),
             Err(_) => None,
         };
-        let Some(rdp_contents) = rdp_contents else { continue };
+        let Some(rdp_contents) = rdp_contents else {
+            continue;
+        };
 
         let settings = crate::feed::parse_rdp_file(&rdp_contents);
         // Only ARM Reverse-Connect resources can be brokered by rdpio.
@@ -800,9 +834,7 @@ mod tests {
     #[test]
     fn authorize_url_uses_code_flow_and_native_redirect() {
         let url = build_authorize_url("common", None, None, None);
-        assert!(url.starts_with(
-            "https://login.microsoftonline.com/common/oauth2/v2.0/authorize?"
-        ));
+        assert!(url.starts_with("https://login.microsoftonline.com/common/oauth2/v2.0/authorize?"));
         assert!(url.contains("response_type=code"));
         assert!(url.contains(&format!("client_id={DEFAULT_CLIENT_ID}")));
         // redirect_uri is URL-encoded.
@@ -899,9 +931,13 @@ mod tests {
         assert!(is_microsoft_avd_host(
             "https://rdweb.wvd.microsoft.com/api/arm/v2/x.rdp?sig=secret"
         ));
-        assert!(is_microsoft_avd_host("https://rdweb-eu.wvd.microsoft.com/x.rdp"));
+        assert!(is_microsoft_avd_host(
+            "https://rdweb-eu.wvd.microsoft.com/x.rdp"
+        ));
         assert!(!is_microsoft_avd_host("https://evil.example.com/x.rdp"));
-        assert!(!is_microsoft_avd_host("http://rdweb.wvd.microsoft.com/x.rdp"));
+        assert!(!is_microsoft_avd_host(
+            "http://rdweb.wvd.microsoft.com/x.rdp"
+        ));
     }
 
     #[test]
@@ -914,7 +950,10 @@ mod tests {
             Some("https://rdweb.wvd.microsoft.com/api/arm/feeddiscovery/a/b")
         );
         // A feed document itself (not an envelope) is not followed.
-        assert_eq!(extract_feed_url("<?xml version=\"1.0\"?><ResourceCollection/>"), None);
+        assert_eq!(
+            extract_feed_url("<?xml version=\"1.0\"?><ResourceCollection/>"),
+            None
+        );
         assert_eq!(extract_feed_url("{\"error\":\"x\"}"), None);
     }
 }

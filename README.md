@@ -105,6 +105,16 @@ Entra ID sign-in (system browser)
 - The first connection prompts for the Microsoft sign-in **twice inside
   FreeRDP** (gateway token, then the session host token); rdpio's own token is
   cached, so workspace discovery is silent on later runs.
+- **Login reuses teams-cli (teams-tui-go) when it is configured on the
+  machine**: rdpio silently mints a Windows 365 token from
+  teams-tui-go's cached refresh token (no browser, no MFA), and interactive
+  fallbacks use the same flows teams-cli uses — the PKCE + localhost-loopback
+  browser login and the device-code login (both read teams-tui-go's
+  `~/.config/teams-tui-go/config.json`, including `auth_flow`). This is the
+  login that works in tenants whose Conditional Access blocks the default
+  AVD `nativeclient` flow. Override with `--w365-auth auto|browser|device|paste`
+  or `RDPIO_W365_AUTH`; without a teams-cli config rdpio keeps its own
+  nativeclient paste flow.
 - Camera redirection uses FreeRDP's upstream MS-RDPECAM client and needs a
   FreeRDP built with `CHANNEL_RDPECAM_CLIENT=ON` (upstream default is OFF).
   The provided Nix flake builds one: `nix build .#freerdp-ecam` (or
@@ -285,6 +295,7 @@ is silent — check the startup log if a flag seems to have no effect.
 | `--rdp-file PATH` | Connect using a downloaded `.rdp` file |
 | `--tenant ID`, `--client-id ID` | Override the Entra tenant / app registration |
 | `--w365-device-code` | Use the device-code sign-in flow instead of the browser |
+| `--w365-auth auto\|browser\|device\|paste` | (Linux) interactive login flow. `auto` (default) reuses the teams-cli login when teams-tui-go is configured, else rdpio's own paste flow |
 | `--w365-relogin`, `--w365-logout` | Clear the cached token and sign in again |
 | `--forget-password` | Drop the cached Cloud PC password |
 | `--shortpath` | Probe the W365 Shortpath UDP rendezvous (diagnostic) |

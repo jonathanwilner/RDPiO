@@ -54,10 +54,18 @@ On a real Linux host, a plain `cargo build` works (gcc is standard, no space iss
   refresh, ARM feed discovery, `.rdp` resource download) and the feed parser
   now run on Linux, the token cache stores via the Secret Service with a `0600`
   XDG-state file fallback, and the interactive sign-in uses the system browser
-  (`xdg-open` + paste-the-redirect, with OAuth `state` verification) instead of
-  WebView2. `rdpio --w365` on Linux is a **FreeRDP integration backend**:
-  rdpio discovers the workspace and downloads Microsoft's current signed
-  `.rdp`, then hands it to an upstream FreeRDP 3 client
+  instead of WebView2. The login itself is teams-cli's: when teams-tui-go is
+  configured, `teams_auth.rs` silently mints a W365 token from its cached
+  refresh token (read-only — rdpio never writes to `~/.cache/teams-tui-go`),
+  `browser_auth.rs::authenticate_loopback` is the PKCE + localhost-loopback
+  browser flow (with a paste fallback) that tenants with device-code-blocking
+  Conditional Access need, and the device flow uses teams-tui-go's
+  registrations (`auth_flow`, `client_id`, `browser_client_id` from its
+  `config.json`; `--w365-auth auto|browser|device|paste` overrides). The
+  token cache records which registration minted a token so silent refresh
+  uses the same one. `rdpio --w365` on Linux is a **FreeRDP integration
+  backend**: rdpio discovers the workspace and downloads Microsoft's current
+  signed `.rdp`, then hands it to an upstream FreeRDP 3 client
   (`/gateway:type:arm /sec:aad /dvc:rdpecam`), which owns the ARM gateway,
   RDSAAD session auth, the interactive session, and webcam redirection through
   its upstream MS-RDPECAM client (`CHANNEL_RDPECAM_CLIENT=ON`; the repo flake
@@ -66,7 +74,7 @@ On a real Linux host, a plain `cargo build` works (gcc is standard, no space iss
   RDSTLS v3, the ARM broker tunnel, rendering and RDPECAM natively remains
   future work tracked by the unchecked items below.
   - [x] Portable W365 auth + feed + `.rdp` download (`w365.rs`, `feed.rs`,
-    `browser_auth.rs`, `token_cache.rs`).
+    `browser_auth.rs`, `token_cache.rs`, `teams_auth.rs`).
   - [x] FreeRDP session backend (`freerdp_backend.rs`): capability detection,
     verbatim `.rdp` in a `0600` temp file, argv-vector launch, camera policy
     (`--camera`/`--no-camera`), `--w365-doctor`.
