@@ -1152,9 +1152,9 @@ struct Args {
     /// login panel (`--w365-device-code`). Useful when WebView2 is unavailable.
     w365_device_code: bool,
     /// Linux W365 interactive login flow (`--w365-auth auto|browser|device|paste`).
-    /// `auto` (default) reuses the teams-tui-go login when teams-tui-go is
-    /// configured on this machine, and otherwise falls back to the AVD
-    /// nativeclient paste flow.
+    /// Default `paste`/`auto`: rdpio's own AVD-client browser flow — the only
+    /// registration Entra preauthorizes for the WVD resource on Linux
+    /// (`browser`/`device` remain opt-ins where those pairs are permitted).
     w365_auth: Option<String>,
     /// How FreeRDP's own AAD prompts (`/sec:aad`) are answered
     /// (`--w365-freerdp-auth auto|manual`). `auto` opens the browser and feeds
