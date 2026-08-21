@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128">
+  <!-- rdpio W365: a cloud inside a monitor -->
+  <rect x="14" y="22" width="100" height="68" rx="8" fill="#1e2f4d"/>
+  <rect x="20" y="28" width="88" height="56" rx="4" fill="#0b1a2e"/>
+  <!-- cloud -->
+  <path d="M46 66 a10 10 0 0 1 2-19.8 A16 16 0 0 1 78 42 a11 11 0 0 1 3 21.6 Z"
+        fill="#4aa3ff" opacity="0.95"/>
+  <path d="M40 70 a9 9 0 0 1 1.8-17.8 A14 14 0 0 1 68 47 a10 10 0 0 1 2.6 19.6 Z"
+        fill="#7cc0ff" opacity="0.9" transform="translate(4,4)"/>
+  <!-- stand -->
+  <rect x="56" y="90" width="16" height="10" fill="#1e2f4d"/>
+  <rect x="42" y="100" width="44" height="6" rx="3" fill="#1e2f4d"/>
+  <!-- screen glow -->
+  <rect x="20" y="28" width="88" height="4" fill="#4aa3ff" opacity="0.35"/>
+</svg>

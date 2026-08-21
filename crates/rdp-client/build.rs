@@ -3,6 +3,17 @@
 //! otherwise indistinguishable from current ones.
 
 fn main() {
+    // Reproducible-build override: when RDPIO_BUILD is set in the environment
+    // (e.g. Nix sets it to the flake revision — there is no .git in the
+    // sandbox), that value is embedded verbatim and no git call is made.
+    if let Some(stamp) = std::env::var("RDPIO_BUILD")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+    {
+        println!("cargo:rustc-env=RDPIO_BUILD={stamp}");
+        return;
+    }
     let describe = std::process::Command::new("git")
         .args(["describe", "--always", "--dirty"])
         .output()
