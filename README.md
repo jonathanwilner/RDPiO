@@ -102,19 +102,27 @@ Entra ID sign-in (system browser)
 
 - Windows keeps rdpio's **native** W365 backend (`--w365-backend native`).
 - Linux defaults to the FreeRDP backend (`--w365-backend freerdp`, default).
-- The first connection prompts for the Microsoft sign-in **twice inside
-  FreeRDP** (gateway token, then the session host token); rdpio's own token is
-  cached, so workspace discovery is silent on later runs.
-- **Login reuses teams-tui-go (teams-tui-go) when it is configured on the
-  machine**: rdpio silently mints a Windows 365 token from
-  teams-tui-go's cached refresh token (no browser, no MFA), and interactive
-  fallbacks use the same flows teams-tui-go uses — the PKCE + localhost-loopback
-  browser login and the device-code login (both read teams-tui-go's
-  `~/.config/teams-tui-go/config.json`, including `auth_flow`). This is the
-  login that works in tenants whose Conditional Access blocks the default
-  AVD `nativeclient` flow. Override with `--w365-auth auto|browser|device|paste`
-  or `RDPIO_W365_AUTH`; without a teams-tui-go config rdpio keeps its own
-  nativeclient paste flow.
+- The first connection needs Microsoft sign-ins **inside FreeRDP** too
+  (gateway token, then the session host token) — but rdpio answers those
+  automatically (`--w365-freerdp-auth auto`, the default): it opens the
+  authorize URL in your running browser, watches for the resulting redirect
+  in the browser's local history, and feeds the code back. Manual paste
+  always works; `--w365-freerdp-auth manual` disables the automation.
+- rdpio's own discovery token is cached, so workspace discovery is silent on
+  later runs; FreeRDP's session tokens live only for the connection.
+- **Sign-in story** (verified live against a real Conditional-Access tenant):
+  rdpio's default `--w365-auth paste` is the **AVD first-party client**
+  (`a85cf173…`, the Windows App/FreeRDP registration) in the system browser —
+  it is the only registration Entra will mint `www.wvd.microsoft.com` tokens
+  for on Linux. Cross-app login reuse is **not possible**: teams-tui-go's
+  loopback client is Graph-only (`AADSTS650057`) and the Teams/Office
+  clients are preauthorization-blocked (`AADSTS65002`) — those facts came
+  from live Entra responses. The token + tenant are cached
+  (`~/.local/state/rdpio/`, or the Secret Service when available), so later
+  runs are silent with no MFA. `--w365-auth browser|device` remain as
+  explicit opt-ins for tenants where those registration pairs are permitted
+  (the flows themselves — PKCE + localhost loopback, device codes — are
+  implemented in `browser_auth.rs`/`teams_auth.rs`).
 - Camera redirection uses FreeRDP's upstream MS-RDPECAM client and needs a
   FreeRDP built with `CHANNEL_RDPECAM_CLIENT=ON` (upstream default is OFF).
   The provided Nix flake builds one: `nix build .#freerdp-ecam` (or
@@ -125,8 +133,40 @@ rdpio --w365                     # sign in, pick a Cloud PC, launch FreeRDP
 rdpio --w365 --no-camera         # disable webcam redirection
 rdpio --w365 --camera            # require it (fails clearly if unsupported)
 rdpio --w365 --freerdp-arg /multimon
+rdpio --w365-freerdp-auth manual # paste FreeRDP's codes by hand (auto is default)
 rdpio --w365-doctor              # integration diagnostics
 ```
+
+### Install as a Nix flake (fleet consumption)
+
+The flake in this repo is the idiomatic entry point for NixOS / Home Manager
+fleets (pinned revisions, `nixpkgs.follows`-safe):
+
+```nix
+inputs.rdpio = {
+  url = "github:jonathanwilner/RDPiO/<rev>";   # fork of IOServicesLabs/RDPiO
+  inputs.nixpkgs.follows = "nixpkgs";
+};
+```
+
+Outputs:
+
+| Output | What it is |
+| --- | --- |
+| `packages.rdpio` | the client binary |
+| `packages.freerdp-ecam` | FreeRDP ≥ 3.25 with `CHANNEL_RDPECAM_CLIENT=ON` — built from a **dedicated, non-followed** nixpkgs pin so a consumer's older nixpkgs can never downgrade the bundled client (FreeRDP 3.24 stalls for minutes before its AAD prompt in the ARM path) |
+| `packages.rdpio-w365` (default) | symlinkJoin bundle: rdpio + freerdp-ecam + terminal-aware `rdpio-w365-launch` (pins `RDPIO_FREERDP`, re-execs into `$TERMINAL`/ghostty/alacritty/kitty/xterm/foot/wezterm when started from a launcher with no tty) + XDG desktop entries **“Windows 365 (Cloud PC)”** and **“Windows 365 Connection Doctor”** (fuzzel/DMS/GNOME pick these up) |
+| `overlays.default` | exposes `rdpio`, `rdpio-w365`, `freerdp-ecam` |
+| `homeManagerModules.default` | `programs.rdpio.enable` (+ optional `programs.rdpio.terminal`) |
+| `devShells.default` | rust + the pinned freerdp-ecam + v4l-utils (`RDPIO_FREERDP` preset) |
+
+Deployed example (niri + fuzzel + DMS on NixOS): install `rdpio-w365` in
+`home.packages`, press `super+space`, type `w365`, Enter — a terminal opens,
+the picker runs, and the Cloud PC appears in a native FreeRDP window.
+
+> Upstream lives at [IOServicesLabs/RDPiO](https://github.com/IOServicesLabs/RDPiO);
+> the maintained fork with the Linux W365 integration, the AAD auto-answer and
+> this flake is [jonathanwilner/RDPiO](https://github.com/jonathanwilner/RDPiO).
 
 ## Run it
 
@@ -295,7 +335,8 @@ is silent — check the startup log if a flag seems to have no effect.
 | `--rdp-file PATH` | Connect using a downloaded `.rdp` file |
 | `--tenant ID`, `--client-id ID` | Override the Entra tenant / app registration |
 | `--w365-device-code` | Use the device-code sign-in flow instead of the browser |
-| `--w365-auth auto\|browser\|device\|paste` | (Linux) interactive login flow. `auto` (default) reuses the teams-tui-go login when teams-tui-go is configured, else rdpio's own paste flow |
+| `--w365-freerdp-auth auto\|manual` | (Linux) how FreeRDP's own AAD prompts are answered. `auto` (default) opens the browser and feeds the observed sign-in redirect back automatically |
+| `--w365-auth auto\|browser\|device\|paste` | (Linux) interactive login flow. Default `paste` (rdpio's own AVD-client browser flow) — only the AVD client can mint WVD tokens; `browser`/`device` are opt-ins where those registrations are permitted |
 | `--w365-relogin`, `--w365-logout` | Clear the cached token and sign in again |
 | `--forget-password` | Drop the cached Cloud PC password |
 | `--shortpath` | Probe the W365 Shortpath UDP rendezvous (diagnostic) |

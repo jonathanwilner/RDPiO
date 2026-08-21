@@ -49,35 +49,64 @@ On a real Linux host, a plain `cargo build` works (gcc is standard, no space iss
   §4.2.4 NTLMv2 test vectors + a seal/unseal round-trip (no Windows APIs, no new
   external crates). NLA is a one-time connection handshake, off every per-frame
   path, so this does not affect streaming performance.
-- [ ] **Stage 4 — W365 on Linux.** *Partially done via integration.* The
-  portable half of Stage 4 is complete: `w365.rs` (OAuth code/device flows,
-  refresh, ARM feed discovery, `.rdp` resource download) and the feed parser
-  now run on Linux, the token cache stores via the Secret Service with a `0600`
-  XDG-state file fallback, and the interactive sign-in uses the system browser
-  instead of WebView2. The login itself is teams-tui-go's: when teams-tui-go is
-  configured, `teams_auth.rs` silently mints a W365 token from its cached
-  refresh token (read-only — rdpio never writes to `~/.cache/teams-tui-go`),
-  `browser_auth.rs::authenticate_loopback` is the PKCE + localhost-loopback
-  browser flow (with a paste fallback) that tenants with device-code-blocking
-  Conditional Access need, and the device flow uses teams-tui-go's
-  registrations (`auth_flow`, `client_id`, `browser_client_id` from its
-  `config.json`; `--w365-auth auto|browser|device|paste` overrides). The
-  token cache records which registration minted a token so silent refresh
-  uses the same one. `rdpio --w365` on Linux is a **FreeRDP integration
-  backend**: rdpio discovers the workspace and downloads Microsoft's current
-  signed `.rdp`, then hands it to an upstream FreeRDP 3 client
+- [ ] **Stage 4 — W365 on Linux.** *Done via integration.* The portable
+  half of Stage 4 is complete and **verified end-to-end against a real
+  Conditional-Access tenant (HP/PingID, MFA, consent)**: `w365.rs` (OAuth
+  code/device flows, refresh, ARM feed discovery, `.rdp` resource download)
+  and the feed parser run on Linux, the token cache stores via the Secret
+  Service with a `0600` XDG-state file fallback, and the interactive sign-in
+  uses the system browser. Sign-in facts learned live (all from actual Entra
+  responses, not speculation):
+
+  - Only the **AVD first-party client** (`a85cf173…`) is preauthorized to
+    mint `www.wvd.microsoft.com` tokens on Linux; cross-app login reuse is
+    impossible (teams-tui-go's loopback client is Graph-only —
+    `AADSTS650057`; Teams/Office clients are preauth-blocked —
+    `AADSTS65002`). Hence `--w365-auth paste` (rdpio's own AVD-client flow)
+    is the default; `browser`/`device` (the teams-tui-go-style flows in
+    `teams_auth.rs` / `browser_auth.rs::authenticate_loopback`) remain
+    opt-ins for tenants where those pairs are permitted.
+  - The ARM `feeddiscovery` service gates on an **approved client UA**
+    (`X-MS-User-Agent: MSRDC/10.0.0`, else `INCOMPATIBLE_CLIENT_VERSION`),
+    answers with a MS-TSWF **`TenantFeedURLs`** document (one regional
+    webfeed per subscribed workspace — followed and merged, not the assumed
+    JSON envelope), and its webfeed XML carries a **UTF-8 BOM** that must be
+    stripped before XML sniffing.
+  - First-party grants can return an **opaque access token** (not a JWT),
+    so the tenant GUID is captured from the `id_token` at exchange time and
+    cached (`tenant_id`) for every later feeddiscovery call.
+  - The token cache records which registration minted a token so silent
+    refresh uses the same one.
+
+  `rdpio --w365` on Linux is a **FreeRDP integration backend**: rdpio
+  discovers the workspace and downloads Microsoft's current signed `.rdp`,
+  then hands it to an upstream FreeRDP 3 client
   (`/gateway:type:arm /sec:aad /dvc:rdpecam`), which owns the ARM gateway,
   RDSAAD session auth, the interactive session, and webcam redirection through
   its upstream MS-RDPECAM client (`CHANNEL_RDPECAM_CLIENT=ON`; the repo flake
-  builds one via `nix develop` / `nix build .#freerdp-ecam`). This is a
-  deliberate hand-off, not a port of rdpio's native W365 stack — porting
-  RDSTLS v3, the ARM broker tunnel, rendering and RDPECAM natively remains
-  future work tracked by the unchecked items below.
+  builds one via `nix develop` / `nix build .#freerdp-ecam` — pinned to a
+  non-followed nixpkgs revision so consumers cannot downgrade it below the
+  working 3.25+). This is a deliberate hand-off, not a port of rdpio's native
+  W365 stack — porting RDSTLS v3, the ARM broker tunnel, rendering and
+  RDPECAM natively remains future work tracked by the unchecked items below.
   - [x] Portable W365 auth + feed + `.rdp` download (`w365.rs`, `feed.rs`,
     `browser_auth.rs`, `token_cache.rs`, `teams_auth.rs`).
   - [x] FreeRDP session backend (`freerdp_backend.rs`): capability detection,
     verbatim `.rdp` in a `0600` temp file, argv-vector launch, camera policy
     (`--camera`/`--no-camera`), `--w365-doctor`.
+  - [x] **FreeRDP AAD auto-answer** (`freerdp_backend::run_session`):
+    FreeRDP's `/sec:aad` prints `Browse to:`/`Paste redirect URL here:`
+    prompts per token (gateway, then session host); rdpio answers them
+    itself — open the authorize URL in the running browser, observe the
+    `nativeclient?code=` redirect in the browser's history **through real
+    SQLite** (`rusqlite` bundled — AAD codes are ~1.5 KB and browsers split
+    them across overflow pages; a raw byte scan truncates and Entra answers
+    `AADSTS9002313`), feed the code back. FreeRDP runs under a **pty**
+    (`script -qec`) because its prompt reader
+    (`freerdp_interruptible_get_line`) never wakes on a plain pipe — with
+    piped stdin it stalls before the first prompt (observed on 3.24 and
+    3.30). Verified: picker → Windows 11 desktop in ~35 s, zero interaction.
+    `--w365-freerdp-auth manual` restores hand-pasting.
   - [ ] Port the RDSTLS v3 credential (CNG AES/RSA/cert → RustCrypto) for a
     fully native session (not needed for the FreeRDP backend).
   - [ ] Port the native reverse-connect/ARM tunnel (not needed for the FreeRDP

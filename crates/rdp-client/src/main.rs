@@ -1579,9 +1579,11 @@ WINDOWS 365 / CLOUD PC
                            discovers the workspace, downloads Microsoft's signed
                            .rdp, and hands it to FreeRDP 3 (see PORTING.md).
     --w365-device-code     Use device-code sign-in (no local browser).
-    --w365-auth <FLOW>     auto|browser|device|paste. Default auto: reuse the
-                           teams-tui-go login (teams-tui-go token cache + its
-                           browser/device flows); paste is the AVD client flow.
+    --w365-auth <FLOW>     auto|browser|device|paste (default paste/auto:
+                           rdpio's own AVD-client browser flow). Only the AVD
+                           client can mint WVD tokens (Entra preauth blocks
+                           teams/office clients — see README); browser/device
+                           remain opt-ins where those pairs are permitted.
     --w365-freerdp-auth M  auto|manual. How FreeRDP's own AAD prompts are
                            answered. auto (default) opens the browser and feeds
                            the observed sign-in redirect back automatically.
