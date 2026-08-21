@@ -16,11 +16,13 @@
 //! - camera redirection is enabled only when the installed FreeRDP actually
 //!   has the upstream RDPECAM client channel.
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::io::{self, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{ChildStdin, Command, Stdio};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 /// Candidate executables, best first: the SDL3 client is the maintained one
 /// upstream recommends for AVD; the X11 client is the fallback.
@@ -245,18 +247,371 @@ pub fn write_secure_rdp(contents: &str) -> io::Result<PathBuf> {
     Ok(path)
 }
 
-/// Run the FreeRDP session and remove the temporary `.rdp` afterwards. FreeRDP
-/// inherits stdio so its own interactive AAD prompts work in this terminal.
-pub fn run_session(freerdp: &FreeRdp, argv: &[OsString]) -> io::Result<std::process::ExitStatus> {
-    let mut cmd = Command::new(&freerdp.exe);
-    cmd.args(&argv[1..]);
+/// Shell-quote one word for `script -c`'s inner exec string (single-quote
+/// wrapping; embedded quotes closed-reopened). FreeRDP argv words are paths
+/// and `/flag:value` strings, but quote correctly regardless.
+fn sh_quote(word: &OsStr) -> OsString {
+    let text = word.to_string_lossy();
+    if text.bytes().all(|b| {
+        b.is_ascii_alphanumeric()
+            || matches!(
+                b,
+                b'-' | b'_' | b'.' | b'/' | b':' | b'=' | b',' | b'+' | b'%' | b'@' | b'[' | b']'
+            )
+    }) {
+        word.to_os_string()
+    } else {
+        let mut out = String::from("'");
+        for c in text.chars() {
+            if c == '\'' {
+                out.push_str("'\\''");
+            } else {
+                out.push(c);
+            }
+        }
+        out.push('\'');
+        OsString::from(out)
+    }
+}
+
+/// Run the FreeRDP session and remove the temporary `.rdp` afterwards.
+///
+/// FreeRDP's `/sec:aad` path prints its own AAD prompts on stdout —
+/// `Browse to: <authorize url>` + `Paste redirect URL here:` — once per token
+/// (ARM gateway, then the session host). With `auto_auth`, rdpio answers them
+/// itself: the authorize URL is opened in the system browser (the user's
+/// Microsoft session — MFA/consent — lives there), the resulting
+/// `nativeclient?code=…` redirect is observed in the browser's local history,
+/// and the code URL is fed to FreeRDP's stdin. A manual paste into this
+/// terminal keeps working at any time (stdin is forwarded verbatim).
+///
+/// FreeRDP is run under a pty (`script -qec … /dev/null`) because its AAD
+/// prompt reader (`freerdp_interruptible_get_line`) waits on terminal-ready
+/// events and does not wake on a plain pipe — with piped stdin it stalls
+/// before the first prompt (observed on 3.24 and 3.30 alike). `script` execs
+/// the inner command itself; the words are shell-quoted in
+/// [`sh_quote`] and carry no secrets.
+///
+/// Privacy: only URLs matching Microsoft's `oauth2/nativeclient?code=`
+/// redirect are ever read out of the history files; nothing is logged.
+pub fn run_session(
+    freerdp: &FreeRdp,
+    argv: &[OsString],
+    auto_auth: bool,
+) -> io::Result<std::process::ExitStatus> {
+    use std::io::{BufRead, BufReader};
+    use std::sync::mpsc;
+
+    let histories = history_files();
+    let auto = auto_auth && !histories.is_empty();
+    if auto_auth && histories.is_empty() {
+        tracing::warn!(
+            "no browser history found (Chromium-family or Firefox) — answer FreeRDP's AAD prompts by pasting the redirect URL"
+        );
+    }
+
+    // FreeRDP under a pty via `script -qec "<exe> <args…>" /dev/null` — its
+    // AAD prompt reader does not wake on pipes (see the module doc).
+    let mut inner = String::new();
+    for (i, word) in argv.iter().enumerate() {
+        if i > 0 {
+            inner.push(' ');
+        }
+        inner.push_str(&sh_quote(word).to_string_lossy());
+    }
+    let mut cmd = Command::new("script");
+    cmd.arg("-qec")
+        .arg(&inner)
+        .arg("/dev/null")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     tracing::info!(
         exe = %freerdp.exe.display(),
-        "launching FreeRDP (its own Microsoft sign-in prompts follow in this terminal)"
+        auto_auth = auto,
+        "launching FreeRDP (AAD prompts answered from the browser when possible)"
     );
-    let status = cmd.status()?;
+    let mut child = cmd.spawn()?;
+
+    // FreeRDP's stdin is a pipe we own: the manual-paste forwarder and the
+    // auto-answer write into it. Keeping it in an Option lets EOF on *our*
+    // stdin close nothing (FreeRDP keeps waiting for its codes).
+    let child_stdin: Arc<Mutex<Option<ChildStdin>>> = Arc::new(Mutex::new(child.stdin.take()));
+
+    // Manual path: forward our stdin lines to FreeRDP verbatim (a user pasting
+    // the redirect URL works exactly as before).
+    {
+        let child_stdin = child_stdin.clone();
+        std::thread::spawn(move || {
+            let mut line = String::new();
+            loop {
+                line.clear();
+                match std::io::stdin().read_line(&mut line) {
+                    Ok(0) | Err(_) => return, // our EOF: keep FreeRDP's stdin open
+                    Ok(_) => {}
+                }
+                let mut guard = child_stdin.lock().unwrap_or_else(|p| p.into_inner());
+                let Some(mut w) = guard.as_mut() else { return };
+                if w.write_all(line.as_bytes())
+                    .and_then(|_| w.flush())
+                    .is_err()
+                {
+                    return; // session ended
+                }
+            }
+        });
+    }
+
+    // Output pumps: tee FreeRDP's stdout/stderr through to ours, one line at a
+    // time, and hand each line to the prompt scanner.
+    let (line_tx, line_rx) = mpsc::channel::<String>();
+    let streams: Vec<Box<dyn std::io::Read + Send>> = vec![
+        Box::new(child.stdout.take().expect("stdout piped")),
+        Box::new(child.stderr.take().expect("stderr piped")),
+    ];
+    for stream in streams {
+        let tx = line_tx.clone();
+        std::thread::spawn(move || {
+            for line in BufReader::new(stream).lines().map_while(Result::ok) {
+                let mut out = std::io::stdout().lock();
+                let _ = out.write_all(line.as_bytes());
+                let _ = out.write_all(b"\n");
+                let _ = out.flush();
+                if tx.send(line).is_err() {
+                    return;
+                }
+            }
+        });
+    }
+    drop(line_tx);
+
+    // Prompt scanner: track the latest `Browse to:` URL; when FreeRDP asks
+    // for the redirect URL, auto-answer it (one attempt per prompt instance —
+    // FreeRDP re-prints the prompt if it times out, which starts a new one).
+    {
+        let child_stdin = child_stdin.clone();
+        let last_browse: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let active: Arc<Mutex<Option<(String, Instant)>>> = Arc::new(Mutex::new(None));
+        std::thread::spawn(move || {
+            while let Ok(line) = line_rx.recv() {
+                if let Some(url) = browse_url_from_line(&line) {
+                    *last_browse.lock().unwrap_or_else(|p| p.into_inner()) = Some(url.to_string());
+                }
+                if !line.contains(PASTE_MARKER) {
+                    continue;
+                }
+                let Some(url) = last_browse
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .clone()
+                    .filter(|u| u.starts_with("https://login.microsoftonline.com/"))
+                else {
+                    continue;
+                };
+                // One worker per prompt instance; FreeRDP's 25s re-prints of
+                // the same prompt while the worker polls are ignored.
+                {
+                    let mut act = active.lock().unwrap_or_else(|p| p.into_inner());
+                    if let Some((active_url, since)) = act.as_ref() {
+                        if active_url == &url && since.elapsed() < Duration::from_secs(90) {
+                            continue;
+                        }
+                    }
+                    *act = Some((url.clone(), Instant::now()));
+                }
+                if !auto {
+                    tracing::info!(
+                        "FreeRDP AAD prompt: complete the sign-in in the browser, then paste the final redirect URL here"
+                    );
+                    continue;
+                }
+                let child_stdin = child_stdin.clone();
+                std::thread::spawn(move || auto_answer_prompt(url, child_stdin));
+            }
+        });
+    }
+
+    let status = child.wait()?;
     // Defensive cleanup: callers also remove the file themselves.
     Ok(status)
+}
+
+/// FreeRDP's AAD prompt marker lines (`client.c`, `client_cli_get_avd_access_token`).
+const BROWSE_PREFIX: &str = "Browse to: ";
+const PASTE_MARKER: &str = "Paste redirect URL here";
+
+/// `Browse to: <url>` → `<url>` (FreeRDP prints the authorize URL it built).
+fn browse_url_from_line(line: &str) -> Option<&str> {
+    line.strip_prefix(BROWSE_PREFIX)
+        .map(str::trim)
+        .filter(|u| u.starts_with("https://"))
+}
+
+/// Local browser history databases that may observe the sign-in redirect.
+/// `$RDPIO_BROWSER_HISTORY` overrides everything; otherwise the usual
+/// Chromium-family profiles and Firefox places databases are listed.
+fn history_files() -> Vec<PathBuf> {
+    if let Ok(p) = std::env::var("RDPIO_BROWSER_HISTORY") {
+        if !p.is_empty() {
+            return vec![PathBuf::from(p)];
+        }
+    }
+    let Some(home) = std::env::var("HOME").ok().filter(|s| !s.is_empty()) else {
+        return Vec::new();
+    };
+    let home = PathBuf::from(home);
+    let mut out = Vec::new();
+    // Chromium family: one `History` per profile dir (Default, Profile N, …).
+    for base in [
+        home.join(".config/google-chrome"),
+        home.join(".config/chromium"),
+        home.join(".var/app/com.google.Chrome/config/google-chrome"),
+        home.join(".var/app/org.chromium.Chromium/config/chromium"),
+    ] {
+        if let Ok(rd) = std::fs::read_dir(&base) {
+            for entry in rd.flatten() {
+                let history = entry.path().join("History");
+                if history.is_file() {
+                    out.push(history);
+                }
+            }
+        }
+    }
+    // Firefox: places.sqlite inside each profile dir.
+    if let Ok(rd) = std::fs::read_dir(home.join(".mozilla/firefox")) {
+        for entry in rd.flatten() {
+            let places = entry.path().join("places.sqlite");
+            if places.is_file() {
+                out.push(places);
+            }
+        }
+    }
+    out
+}
+
+/// All Microsoft OAuth redirect code URLs currently present in the browser
+/// histories. Queried through SQLite (a copy is taken first — the browser owns
+/// the live file) because browsers store long URLs — AAD authorization codes
+/// are ~1.5 KB — split across SQLite overflow pages, invisible to raw scans.
+/// Only rows whose URL contains Microsoft's `nativeclient?code=` redirect are
+/// ever selected; nothing else is read.
+fn scan_code_urls() -> std::collections::HashSet<String> {
+    use rusqlite::OpenFlags;
+    use std::collections::HashSet;
+
+    let mut out = HashSet::new();
+    for path in history_files() {
+        let Some(tmp) = copy_to_temp(&path) else {
+            continue;
+        };
+        let conn = rusqlite::Connection::open_with_flags(&tmp, OpenFlags::SQLITE_OPEN_READ_ONLY);
+        let Ok(conn) = conn else { continue };
+        // Chrome/Chromium store visits in `urls`; Firefox in `moz_places`.
+        for table in ["urls", "moz_places"] {
+            let sql =
+                format!("SELECT url FROM {table} WHERE url LIKE '%/oauth2/nativeclient?code=%'");
+            let Ok(mut stmt) = conn.prepare(&sql) else {
+                continue;
+            };
+            let Ok(rows) = stmt.query_map([], |row| row.get::<_, String>(0)) else {
+                continue;
+            };
+            for url in rows.flatten() {
+                out.insert(url);
+            }
+        }
+        let _ = std::fs::remove_file(&tmp);
+    }
+    out
+}
+
+/// Snapshot a browser database to a fresh temp file (the browser may hold the
+/// original locked or mid-write; a copy is always safe to read).
+fn copy_to_temp(path: &Path) -> Option<PathBuf> {
+    let mut seed = [0u8; 4];
+    if !crate::rng::fill(&mut seed) {
+        return None;
+    }
+    let tmp = std::env::temp_dir().join(format!(
+        "rdpio-hist-{}-{}",
+        std::process::id(),
+        seed.iter().map(|b| format!("{b:02x}")).collect::<String>()
+    ));
+    std::fs::copy(path, &tmp).ok()?;
+    Some(tmp)
+}
+
+/// Open `url` where the user's Microsoft session lives, as reliably as
+/// possible: a new tab in the already-running browser instance (launching
+/// `google-chrome URL` with the same profile defers to the running singleton),
+/// else the desktop portal (`xdg-open`), else a fresh browser window. The
+/// portal alone is not enough — it can silently drop the request.
+fn open_in_running_browser(url: &str) {
+    for (bin, proc_name) in [
+        ("google-chrome", "chrome"),
+        ("google-chrome-stable", "chrome"),
+        ("chromium", "chromium"),
+        ("firefox", "firefox"),
+    ] {
+        // Only defer to the running instance when that browser is actually up
+        // (its singleton owns the profile; a fresh launch would race it).
+        let running = std::process::Command::new("pgrep")
+            .arg("-x")
+            .arg(proc_name)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if running {
+            if let Ok(mut child) = Command::new(bin)
+                .arg(url)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+            {
+                tracing::debug!(browser = bin, "opened authorize URL in the running browser");
+                std::thread::spawn(move || {
+                    let _ = child.wait();
+                });
+                return;
+            }
+        }
+    }
+    crate::browser_auth::open_browser(None, url);
+}
+
+/// Answer one FreeRDP AAD prompt: open the browser at its authorize URL and
+/// watch for a *new* redirect code (anything not present when this started —
+/// codes are single-use, and old ones linger in the history for months).
+/// The code URL is written to FreeRDP's stdin the moment it appears; nothing
+/// about it is logged.
+fn auto_answer_prompt(url: String, child_stdin: Arc<Mutex<Option<ChildStdin>>>) {
+    use std::collections::HashSet;
+
+    open_in_running_browser(&url);
+    tracing::info!(
+        "FreeRDP AAD prompt: browser opened — completing the sign-in (then this prompt answers itself)"
+    );
+    let baseline: HashSet<String> = scan_code_urls();
+    for _ in 0..60 {
+        std::thread::sleep(Duration::from_secs(2));
+        let observed = scan_code_urls();
+        let candidate = observed.into_iter().find(|u| !baseline.contains(u));
+        let Some(code_url) = candidate else { continue };
+        tracing::info!("FreeRDP AAD prompt answered automatically from the browser sign-in");
+        let mut guard = child_stdin.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(mut w) = guard.as_mut() {
+            let _ = w.write_all(code_url.as_bytes());
+            let _ = w.write_all(b"\n");
+            let _ = w.flush();
+        }
+        return;
+    }
+    tracing::warn!(
+        "no sign-in redirect observed in the browser within 120s — complete the sign-in manually and paste the final URL here"
+    );
 }
 
 // --- V4L camera detection ---------------------------------------------------
@@ -337,5 +692,111 @@ mod tests {
             b"rdpecam-device.client"
         ));
         assert!(!contains_marker(b"hello world", b"rdpecam-device.client"));
+    }
+
+    #[test]
+    fn browse_url_extracted_from_freerdp_prompt_line() {
+        assert_eq!(
+            browse_url_from_line(
+                "Browse to: https://login.microsoftonline.com/common/oauth2/v2.0/authorize?client_id=x"
+            ),
+            Some("https://login.microsoftonline.com/common/oauth2/v2.0/authorize?client_id=x")
+        );
+        // Not a URL line / not https → None.
+        assert_eq!(browse_url_from_line("Browse to: garbage"), None);
+        assert_eq!(browse_url_from_line("Something else entirely"), None);
+        assert_eq!(browse_url_from_line("Paste redirect URL here: "), None);
+    }
+
+    #[test]
+    fn history_scan_reads_long_urls_across_overflow_pages() {
+        // AAD codes are ~1.5 KB; SQLite splits such rows across overflow
+        // pages. Build a real DB with one very long code URL and prove the
+        // query returns it whole (the old raw byte scan truncated at 481).
+        use rusqlite::OpenFlags;
+        let mut seed = [0u8; 4];
+        assert!(crate::rng::fill(&mut seed));
+        let dir = std::env::temp_dir().join(format!(
+            "rdpio-hist-test-{}-{}",
+            std::process::id(),
+            seed.iter().map(|b| format!("{b:02x}")).collect::<String>()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("History");
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "PRAGMA page_size=512; CREATE TABLE urls(id INTEGER PRIMARY KEY, url TEXT);",
+        )
+        .unwrap();
+        let long_code = "0.".to_string() + &"AQoA".repeat(400); // ~1.6 KB
+        let url = format!(
+            "https://login.microsoftonline.com/common/oauth2/nativeclient?code={long_code}&session_state=x"
+        );
+        conn.execute("INSERT INTO urls(url) VALUES (?1)", [&url])
+            .unwrap();
+        drop(conn);
+
+        let url_len = url.len();
+        assert!(
+            url_len > 1500,
+            "test URL must be overflow-sized, got {url_len}"
+        );
+        std::env::set_var("RDPIO_BROWSER_HISTORY", &db);
+        let scanned = scan_code_urls();
+        std::env::remove_var("RDPIO_BROWSER_HISTORY");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(scanned.len(), 1);
+        assert_eq!(scanned.iter().next().unwrap().len(), url_len);
+    }
+
+    #[test]
+    fn history_scan_ignores_files_without_matching_urls() {
+        use rusqlite::OpenFlags;
+        let mut seed = [0u8; 4];
+        assert!(crate::rng::fill(&mut seed));
+        let dir = std::env::temp_dir().join(format!(
+            "rdpio-hist-test2-{}-{}",
+            std::process::id(),
+            seed.iter().map(|b| format!("{b:02x}")).collect::<String>()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("History");
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch("CREATE TABLE urls(id INTEGER PRIMARY KEY, url TEXT);")
+            .unwrap();
+        conn.execute(
+            "INSERT INTO urls(url) VALUES ('https://example.com/irrelevant')",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        std::env::set_var("RDPIO_BROWSER_HISTORY", &db);
+        let scanned = scan_code_urls();
+        std::env::remove_var("RDPIO_BROWSER_HISTORY");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(scanned.is_empty());
+    }
+
+    #[test]
+    fn plain_freerdp_words_pass_through_unquoted() {
+        for word in [
+            "/nix/store/x-freerdp-3.30.0/bin/sdl-freerdp",
+            "/run/user/1000/rdpio-w365-1-ab.rdp",
+            "/gateway:type:arm",
+            "/sec:aad",
+            "/dvc:rdpecam",
+        ] {
+            assert_eq!(sh_quote(OsStr::new(word)), OsString::from(word));
+        }
+    }
+
+    #[test]
+    fn spaces_and_quotes_are_shell_quoted() {
+        assert_eq!(
+            sh_quote(OsStr::new("/path/with space/freerdp")),
+            OsString::from("'/path/with space/freerdp'")
+        );
+        assert_eq!(sh_quote(OsStr::new("it's")), OsString::from("'it'\\''s'"));
     }
 }

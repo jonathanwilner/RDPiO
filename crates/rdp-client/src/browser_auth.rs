@@ -31,7 +31,7 @@ const LOOPBACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15 
 /// Open the system browser at `url` (best-effort; the URL is also printed).
 /// `command` may be a multi-word shell-free command line (e.g. teams-tui-go's
 /// `browser_command`); it is split on whitespace, never through a shell.
-fn open_browser(command: Option<&str>, url: &str) {
+pub(crate) fn open_browser(command: Option<&str>, url: &str) {
     let default = "xdg-open".to_string();
     let command = command
         .map(String::from)

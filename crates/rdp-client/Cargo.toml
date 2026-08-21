@@ -39,6 +39,12 @@ webpki-roots = "0.26"
 # Pure-Rust (zbus/secret-service); falls back to a 0600 state file when no
 # Secret Service is available.
 keyring = "2"
+# Reading the browser's sign-in redirect out of its local history for the
+# FreeRDP AAD auto-answer. `bundled` compiles the bundled SQLite amalgamation
+# (no system dependency); browsers split long URLs across SQLite overflow
+# pages, so a raw byte scan is not enough.
+rusqlite = { version = "0.40", features = ["bundled"] }
+
 # PKCE (RFC 7636) for the teams-cli browser login. Both are already in the
 # workspace tree via rdp-crypto; versions track it.
 sha2.workspace = true
