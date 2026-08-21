@@ -126,6 +126,14 @@ fn main() {
     #[cfg(windows)]
     crate::crash::install();
 
+    #[cfg(windows)]
+    if args.w365_backend == Some(SessionBackend::FreeRdp) {
+        tracing::error!(
+            "--w365-backend freerdp is Linux-only; Windows uses the native rdpio W365 backend"
+        );
+        std::process::exit(2);
+    }
+
     // Diagnostic: offline-replay a captured EGFX stream (no server).
     if let Some(path) = args.replay_gfx.clone() {
         #[cfg(windows)]
