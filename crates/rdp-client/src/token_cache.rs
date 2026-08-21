@@ -80,7 +80,7 @@ fn cache_doc(tenant: &str, client_id: Option<&str>, token: &AccessToken) -> Stri
         "tenant": tenant,
         "client_id": client_id,
         // The registration that minted this token — may differ from the
-        // requested `client_id` when the login was reused from the teams-cli
+        // requested `client_id` when the login was reused from the teams-tui-go
         // cache. A later refresh must use it, or Entra rejects the grant.
         "token_client_id": token.client_id,
         "refresh_token": token.refresh_token,
@@ -315,7 +315,7 @@ pub fn load_silent(tenant: &str, client_id: Option<&str>) -> Option<AccessToken>
         .map(String::from);
     // The registration that minted the cached token: the new `token_client_id`
     // when present, else the doc's `client_id` (caches written before the
-    // teams-cli reuse existed only ever used the requested client).
+    // teams-tui-go reuse existed only ever used the requested client).
     let mint_client = doc
         .get("token_client_id")
         .and_then(|v| v.as_str())
@@ -345,7 +345,7 @@ pub fn load_silent(tenant: &str, client_id: Option<&str>) -> Option<AccessToken>
 
     // Otherwise mint a fresh access token from the refresh token (silent).
     // The grant must use the registration that minted the cached token —
-    // rdpio's AVD client for normal logins, the teams-cli registration for a
+    // rdpio's AVD client for normal logins, the teams-tui-go registration for a
     // login reused from teams-tui-go.
     let refresh = refresh?;
     tracing::info!("refreshing W365 access token from cached refresh token (no MFA)");
@@ -450,7 +450,7 @@ mod tests {
     }
 
     /// The minting registration survives the round trip and is what a later
-    /// silent refresh uses — the teams-cli-reused login must refresh with the
+    /// silent refresh uses — the teams-tui-go-reused login must refresh with the
     /// teams registration, not rdpio's AVD client.
     #[test]
     fn minted_client_id_round_trip() {

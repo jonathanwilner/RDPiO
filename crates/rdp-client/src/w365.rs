@@ -36,9 +36,9 @@ pub struct AccessToken {
     pub username: Option<String>,
     /// The app registration that actually minted this token (the `client_id`
     /// sent to the token endpoint). Tokens can be acquired through different
-    /// registrations (rdpio's AVD client, or the teams-cli login reused via
+    /// registrations (rdpio's AVD client, or the teams-tui-go login reused via
     /// [`crate::teams_auth`]); a later refresh-token grant must use the same
-    /// one or Entra rejects it. Mirrors teams-cli's `TokenResponse.ClientID`.
+    /// one or Entra rejects it. Mirrors teams-tui-go's `TokenResponse.ClientID`.
     pub client_id: Option<String>,
 }
 
@@ -277,7 +277,7 @@ pub(crate) const AUTH_CODE_SCOPE: &str =
 ///
 /// `scope` is forwarded to the token endpoint when given; omitted it means
 /// "the scopes this refresh token was originally granted", which is what
-/// rdpio's own cache wants. Cross-registration reuse (the teams-cli login)
+/// rdpio's own cache wants. Cross-registration reuse (the teams-tui-go login)
 /// must pass the W365 scope explicitly so Entra mints a `www.wvd.microsoft.com`
 /// audience instead of the originally-granted Microsoft Graph one.
 pub fn refresh_token(
@@ -331,7 +331,7 @@ pub fn refresh_token(
 // token. No client secret and no PKCE — exactly as FreeRDP's `client.c` does.
 //
 // Tenants whose Conditional Access blocks both of those (e.g. device-code
-// error 53003) can sign in through the teams-cli login instead (see
+// error 53003) can sign in through the teams-tui-go login instead (see
 // [`crate::teams_auth`]): the PKCE + localhost-loopback browser flow that
 // teams-tui-go uses, plus silent reuse of its token cache.
 

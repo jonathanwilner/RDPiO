@@ -1,4 +1,4 @@
-//! Reuse the teams-cli (~/src/newteams, `teams-tui-go`) login for W365.
+//! Reuse the teams-tui-go (~/src/newteams, `teams-tui-go`) login for W365.
 //!
 //! teams-tui-go signs in to Microsoft with two public-client flows:
 //!
@@ -15,7 +15,7 @@
 //! with the `client_id` that acquired it. rdpio reuses that login **read-only**:
 //! a refresh-token grant with the W365 scope mints a
 //! `https://www.wvd.microsoft.com` access token with no browser and no MFA,
-//! exactly how teams-cli itself refreshes. rdpio stores the result in its own
+//! exactly how teams-tui-go itself refreshes. rdpio stores the result in its own
 //! cache ([`crate::token_cache`]) and never writes to teams-tui-go's files.
 //!
 //! The same registrations also power rdpio's interactive fallbacks
@@ -81,7 +81,7 @@ fn xdg_dir(env_var: &str, fallback: &str) -> Option<std::path::PathBuf> {
     Some(std::path::PathBuf::from(home).join(fallback))
 }
 
-/// Load the teams-tui-go config. `Ok(None)` when there is no file (teams-cli
+/// Load the teams-tui-go config. `Ok(None)` when there is no file (teams-tui-go
 /// not installed / never configured) — callers then use rdpio's own defaults.
 /// A present-but-unparseable file is an error worth surfacing, not hiding.
 pub fn load_config() -> Result<Option<TeamsCli>, String> {
@@ -147,7 +147,7 @@ fn load_token() -> Option<TeamsToken> {
     })
 }
 
-/// Try to mint a W365 access token from the teams-cli login, silently.
+/// Try to mint a W365 access token from the teams-tui-go login, silently.
 ///
 /// Sends the refresh-token grant to `login.microsoftonline.com` with the W365
 /// scope, using the registration recorded in the teams token cache — the same
@@ -160,13 +160,13 @@ pub fn seed_w365_token(tenant: &str) -> Option<AccessToken> {
     let token = match load_token() {
         Some(t) => t,
         None => {
-            tracing::debug!("no teams-cli token cache to reuse");
+            tracing::debug!("no teams-tui-go token cache to reuse");
             return None;
         }
     };
     tracing::info!(
         client = %token.client_id,
-        "reusing the teams-cli sign-in to obtain a Windows 365 token (no browser, no MFA)"
+        "reusing the teams-tui-go sign-in to obtain a Windows 365 token (no browser, no MFA)"
     );
     match w365::refresh_token(
         tenant,
@@ -185,7 +185,7 @@ pub fn seed_w365_token(tenant: &str) -> Option<AccessToken> {
             // description, never the token material.
             tracing::info!(
                 error = %e,
-                "the teams-cli refresh token could not mint a W365 token; falling back to interactive sign-in"
+                "the teams-tui-go refresh token could not mint a W365 token; falling back to interactive sign-in"
             );
             None
         }

@@ -5,7 +5,7 @@
 //! ([`crate::webview_auth`]). Linux has no embedded WebView here, so this
 //! module implements the interactive flows with the system browser:
 //!
-//! - [`authenticate_loopback`] — the teams-cli login: authorization-code grant
+//! - [`authenticate_loopback`] — the teams-tui-go login: authorization-code grant
 //!   with PKCE and a `http://localhost:<port>` loopback redirect. The browser
 //!   lands on a tiny local listener (no copy-paste needed); when the browser
 //!   runs on another machine, the final redirect URL can be pasted instead.
@@ -231,7 +231,7 @@ pub enum BrowserAuthError {
     StateMismatch,
 }
 
-/// The teams-cli login for W365: authorization-code grant with PKCE against a
+/// The teams-tui-go login for W365: authorization-code grant with PKCE against a
 /// loopback-capable registration, racing a local HTTP listener against pasted
 /// input. `client_id` is the loopback-capable public client (teams-tui-go's
 /// `browser_client_id` by default — see [`crate::teams_auth`]);
@@ -268,7 +268,7 @@ pub fn authenticate_loopback(
         url.push_str(&format!("&state={}", w365::url_encode(state)));
     }
 
-    println!("Sign in to Windows 365 with your browser (teams-cli login):");
+    println!("Sign in to Windows 365 with your browser (teams-tui-go login):");
     println!();
     println!("  {url}");
     println!();
@@ -356,7 +356,7 @@ pub fn authenticate_loopback(
 
 /// Interactive system-browser sign-in with the AVD first-party client and the
 /// registered `nativeclient` redirect — the FreeRDP-compatible paste flow
-/// (`--w365-auth paste`, and the default when no teams-cli login is set up).
+/// (`--w365-auth paste`, and the default when no teams-tui-go login is set up).
 pub fn authenticate(
     tenant: &str,
     client_id: Option<&str>,

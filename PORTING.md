@@ -54,7 +54,7 @@ On a real Linux host, a plain `cargo build` works (gcc is standard, no space iss
   refresh, ARM feed discovery, `.rdp` resource download) and the feed parser
   now run on Linux, the token cache stores via the Secret Service with a `0600`
   XDG-state file fallback, and the interactive sign-in uses the system browser
-  instead of WebView2. The login itself is teams-cli's: when teams-tui-go is
+  instead of WebView2. The login itself is teams-tui-go's: when teams-tui-go is
   configured, `teams_auth.rs` silently mints a W365 token from its cached
   refresh token (read-only — rdpio never writes to `~/.cache/teams-tui-go`),
   `browser_auth.rs::authenticate_loopback` is the PKCE + localhost-loopback
