@@ -58,9 +58,18 @@ mod websocket;
 #[cfg(windows)]
 mod webview_auth;
 #[cfg(windows)]
-mod token_cache;
-#[cfg(windows)]
 mod password_cache;
+
+// The token cache logic is portable; only the protection at rest differs
+// (DPAPI on Windows, Secret Service / 0600 state file on Linux).
+mod token_cache;
+
+// Linux W365 integration: system-browser sign-in glue and the FreeRDP
+// session handoff (see PORTING.md, Stage 4). Windows keeps its native backend.
+#[cfg(not(windows))]
+mod browser_auth;
+#[cfg(not(windows))]
+mod freerdp_backend;
 
 /// Resolve the account password the AVD/W365 RDSTLS v3 credential encrypts.
 /// Precedence: explicit `--password` (cached for next time) → DPAPI-cached
@@ -136,13 +145,37 @@ fn main() {
         return;
     }
 
+    // Diagnostics for the Linux W365/FreeRDP integration.
+    #[cfg(not(windows))]
+    if args.w365_doctor {
+        w365_doctor(&args);
+        return;
+    }
+    #[cfg(windows)]
+    if args.w365_doctor {
+        tracing::info!("--w365-doctor: the native Windows backend needs no FreeRDP integration");
+    }
+
     if args.host.is_some() || args.w365 || args.feed.is_some() {
         // Windows opens a window and paints the live desktop. Other platforms
         // run the same protocol stack headless, logging decoded rectangles.
         #[cfg(windows)]
         let result = win::run_connected(&args).map_err(|e| e.to_string());
         #[cfg(not(windows))]
-        let result = run_connect(&args).map_err(|e| e.to_string());
+        let result = {
+            let backend = args
+                .w365_backend
+                .unwrap_or_else(SessionBackend::platform_default);
+            if args.w365 && backend == SessionBackend::FreeRdp {
+                run_w365_freerdp(&args).map_err(|e| e.to_string())
+            } else if args.w365 {
+                Err("the native W365 backend requires the Windows build; \
+                     on Linux use --w365-backend freerdp (the default)"
+                    .into())
+            } else {
+                run_connect(&args).map_err(|e| e.to_string())
+            }
+        };
 
         if let Err(err) = result {
             tracing::error!(error = %err, "connection attempt failed");
@@ -439,6 +472,280 @@ fn config_from_args(args: &Args) -> ClientConfig {
     config
 }
 
+// --- Linux W365 integration: discover, download Microsoft's .rdp, launch FreeRDP
+
+/// Camera-redirection policy (pure — unit-tested).
+///
+/// Default: enable when FreeRDP's RDPECAM client exists and a local camera
+/// node exists. `--camera` makes RDPECAM mandatory (actionable error when the
+/// build lacks it); `--no-camera` always disables. A missing camera never
+/// blocks an ordinary `--w365` run.
+#[cfg(not(windows))]
+fn decide_camera(
+    explicit: Option<bool>,
+    rdpecam: freerdp_backend::RdpecamSupport,
+    cameras: usize,
+) -> Result<bool, String> {
+    let has_rdpecam = rdpecam == freerdp_backend::RdpecamSupport::Yes;
+    match explicit {
+        Some(false) => Ok(false),
+        Some(true) => {
+            if !has_rdpecam {
+                return Err(
+                    "camera redirection requested (--camera), but this FreeRDP build has no \
+                     MS-RDPECAM client. A build with CHANNEL_RDPECAM_CLIENT=ON is required \
+                     (on Nix: nixpkgs freerdp with the flag enabled, e.g. this repo's \
+                     flake #freerdp-ecam)."
+                        .into(),
+                );
+            }
+            if cameras == 0 {
+                tracing::warn!(
+                    "--camera given but no /dev/video* capture device was found; \
+                     redirecting anyway (FreeRDP will expose no camera)"
+                );
+            }
+            Ok(true)
+        }
+        None => {
+            if !has_rdpecam {
+                tracing::warn!(
+                    support = ?rdpecam,
+                    "camera redirection unavailable: this FreeRDP build lacks the \
+                     MS-RDPECAM client (needs CHANNEL_RDPECAM_CLIENT=ON). \
+                     Connecting without the camera."
+                );
+                return Ok(false);
+            }
+            if cameras == 0 {
+                tracing::info!("no local camera found; connecting without redirection");
+                return Ok(false);
+            }
+            Ok(true)
+        }
+    }
+}
+
+/// Terminal Cloud PC picker: one resource connects directly; several list and
+/// read `1..=n`. Returns `None` on cancel/invalid selection.
+#[cfg(not(windows))]
+fn choose_cloud_pc_terminal(entries: &[crate::feed::FeedEntry]) -> Option<usize> {
+    if entries.len() == 1 {
+        return Some(0);
+    }
+    println!(
+        "Windows 365 / AVD desktops:
+"
+    );
+    for (i, e) in entries.iter().enumerate() {
+        println!("  {:>2}. {}", i + 1, e.display_name);
+    }
+    print!("\nSelect [1-{}]: ", entries.len());
+    use std::io::Write as _;
+    std::io::stdout().flush().ok();
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line).ok()?;
+    let n: usize = line.trim().parse().ok()?;
+    (1..=entries.len()).contains(&n).then(|| n - 1)
+}
+
+/// The Linux `--w365` path: rdpio authenticates and discovers the workspace,
+/// downloads Microsoft's current signed `.rdp` resource, and hands it to an
+/// upstream FreeRDP 3 client. See [`freerdp_backend`].
+#[cfg(not(windows))]
+fn run_w365_freerdp(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
+    let tenant = args.tenant.clone().unwrap_or_else(|| "common".into());
+
+    // `--rdp-file`: replay a local W365/AVD `.rdp` (e.g. one saved with
+    // `--save-rdp`). FreeRDP authenticates the session itself, so no discovery
+    // or rdpio-side token is needed on this path.
+    let rdp_contents = if let Some(rdp_path) = args.rdp_file.clone() {
+        let contents = std::fs::read_to_string(&rdp_path)
+            .map_err(|e| format!("could not read --rdp-file {rdp_path}: {e}"))?;
+        tracing::info!(path = %rdp_path, "connecting from .rdp file via FreeRDP");
+        contents
+    } else {
+        discover_and_fetch_rdp(args, &tenant)?
+    };
+
+/// Authenticate and discover the workspace via the existing AVD machinery,
+/// then download Microsoft's current signed `.rdp` for the chosen resource.
+#[cfg(not(windows))]
+fn discover_and_fetch_rdp(args: &Args, tenant: &str) -> Result<String, Box<dyn std::error::Error>> {
+    if args.w365_relogin {
+        let _ = token_cache::clear(&tenant, args.client_id.as_deref());
+    }
+
+    // Reuse the cached refresh token when possible (no browser, no MFA); fall
+    // back to an interactive sign-in — the system browser on Linux (with a
+    // device-code escape hatch for headless setups).
+    let token = match (!args.w365_relogin)
+        .then(|| token_cache::load_silent(&tenant, args.client_id.as_deref()))
+        .flatten()
+    {
+        Some(t) => t,
+        None => {
+            let t = if args.w365_device_code {
+                w365::authenticate_device_code(&tenant, args.client_id.as_deref(), None)?
+            } else {
+                browser_auth::authenticate(&tenant, args.client_id.as_deref())?
+            };
+            token_cache::store(&tenant, args.client_id.as_deref(), &t);
+            t
+        }
+    };
+    let signed_in_as = token
+        .username
+        .clone()
+        .or_else(|| w365::token_tenant(&token.token))
+        .unwrap_or_else(|| tenant.to_string());
+    tracing::info!(account = %signed_in_as, "signed in to Windows 365");
+
+    // Discover the workspace through the existing AVD ARM feed.
+    tracing::info!("fetching Windows 365 workspace...");
+    let entries = w365::fetch_feed(
+        &token,
+        &tenant,
+        args.client_id.as_deref(),
+        args.feed.as_deref(),
+    )?;
+    if entries.is_empty() {
+        return Err("W365: the workspace feed returned no desktop resources".into());
+    }
+    tracing::info!(count = entries.len(), "desktops discovered");
+
+    let choice =
+        choose_cloud_pc_terminal(&entries).ok_or("Cloud PC selection cancelled")?;
+    let chosen = &entries[choice];
+    tracing::info!(name = %chosen.display_name, "selected desktop");
+
+    // Microsoft's own current signed `.rdp` — never synthesized, never edited.
+    let rdp_contents = if let Some(rdp) = chosen.rdp_file.as_ref() {
+        tracing::info!("using .rdp payload carried by the feed entry");
+        rdp.clone()
+    } else if let Some(url) = chosen.rdp_url.as_ref() {
+        w365::fetch_rdp_file(&token, url)?
+    } else {
+        return Err(
+            "the feed entry has no .rdp resource file URL (the workspace may not \
+             publish one for this resource)"
+                .into(),
+        );
+    };
+    Ok(rdp_contents)
+}
+
+
+    if let Some(out) = args.save_rdp.as_deref() {
+        std::fs::write(out, &rdp_contents).map_err(|e| format!("--save-rdp {out}: {e}"))?;
+        tracing::warn!(
+            path = %out,
+            "diagnostic .rdp written — it contains per-tenant connection material; \
+             do not commit or share it"
+        );
+    }
+
+    // Capability checks before the launch.
+    let freerdp = freerdp_backend::FreeRdp::find().ok_or(
+        "no FreeRDP 3 client found. Install freerdp 3.x (sdl-freerdp3 / xfreerdp3) \
+         or set RDPIO_FREERDP=/path/to/sdl-freerdp3",
+    )?;
+    let version = freerdp
+        .version
+        .map(|(a, b)| format!("{a}.{b}"))
+        .unwrap_or_else(|| "3.x".into());
+    tracing::info!(exe = %freerdp.exe.display(), version = %version, "FreeRDP found");
+
+    let rdpecam = freerdp.rdpecam_support();
+    let cameras = freerdp_backend::camera_device_count();
+    let camera = decide_camera(args.camera, rdpecam, cameras)?;
+    if camera {
+        tracing::info!(
+            devices = cameras,
+            "RDPECAM available; camera redirection enabled"
+        );
+    }
+
+    // Secure 0600 temp file with the verbatim Microsoft payload; removed below.
+    let rdp_path = freerdp_backend::write_secure_rdp(&rdp_contents)?;
+    let argv = freerdp_backend::build_args(&freerdp.exe, &rdp_path, camera, &args.freerdp_arg);
+    let result = freerdp_backend::run_session(&freerdp, &argv);
+    let _ = std::fs::remove_file(&rdp_path); // never persist by default
+    result?;
+    Ok(())
+}
+
+/// `--w365-doctor` (Linux): verify the integration's moving parts without
+/// starting a session. Uses only silent auth (no browser).
+#[cfg(not(windows))]
+fn w365_doctor(args: &Args) {
+    let ok = |b: bool| if b { "ok" } else { "MISSING" };
+    println!(
+        "rdpio {} — W365 integration doctor",
+        env!("CARGO_PKG_VERSION")
+    );
+    println!("  RDPiO                    ok");
+
+    match freerdp_backend::FreeRdp::find() {
+        Some(f) => {
+            let v = f
+                .version
+                .map(|(a, b)| format!("{a}.{b}"))
+                .unwrap_or_else(|| "?".into());
+            println!("  FreeRDP                  {v}  ({})", f.exe.display());
+            println!(
+                "  AVD ARM gateway          {}",
+                ok(f.version.is_some_and(|(ma, _)| ma >= 3))
+            );
+            println!("  AAD session auth         ok (FreeRDP handles sign-in interactively)");
+            println!("  RDPECAM client           {:?}", f.rdpecam_support());
+            let cams = freerdp_backend::camera_device_count();
+            println!("  V4L capture devices      {cams}");
+        }
+        None => {
+            println!("  FreeRDP                  MISSING (install freerdp3 / sdl-freerdp3, or set RDPIO_FREERDP)");
+            println!("  AVD ARM gateway          unknown");
+            println!("  RDPECAM client           unknown");
+        }
+    }
+
+    let tenant = args.tenant.clone().unwrap_or_else(|| "common".into());
+    match token_cache::load_silent(&tenant, args.client_id.as_deref()) {
+        Some(t) => {
+            let who = t
+                .username
+                .clone()
+                .or_else(|| w365::token_tenant(&t.token))
+                .unwrap_or_else(|| tenant.clone());
+            println!("  Microsoft auth cache     ok (silent sign-in as {who})");
+            match w365::fetch_feed(&t, &tenant, args.client_id.as_deref(), None) {
+                Ok(entries) => {
+                    println!(
+                        "  AVD workspace            ok ({} desktop resources)",
+                        entries.len()
+                    );
+                    for e in entries.iter().take(5) {
+                        println!(
+                            "    · {}{}",
+                            e.display_name,
+                            if e.rdp_url.is_some() {
+                                "  [.rdp available]"
+                            } else {
+                                ""
+                            }
+                        );
+                    }
+                }
+                Err(e) => println!("  AVD workspace            FAILED ({e})"),
+            }
+        }
+        None => {
+            println!("  Microsoft auth cache     none (not signed in yet — run: rdpio --w365)");
+            println!("  AVD workspace            not checked (requires sign-in)");
+        }
+    }
+}
+
 /// Headless connect path (non-Windows): negotiate, activate, and log decoded
 /// bitmap rectangles. Exercises the entire protocol stack without a GPU.
 #[cfg(not(windows))]
@@ -594,6 +901,32 @@ impl Default for QualityPreset {
     }
 }
 
+/// Which engine drives a `--w365` session. Windows keeps rdpio's own native
+/// W365 stack; Linux hands the discovered, Microsoft-signed `.rdp` resource to
+/// an upstream FreeRDP 3 client (see PORTING.md, Stage 4 — rdpio's native Linux
+/// interactive backend is not complete, and this deliberately does not port it:
+/// FreeRDP already owns the AVD ARM gateway, RDSAAD session auth, the RDP
+/// protocol/graphics stack and the MS-RDPECAM webcam channel).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionBackend {
+    /// rdpio's own W365 implementation (Windows).
+    Native,
+    /// Upstream FreeRDP 3 launched with Microsoft's `.rdp` (Linux).
+    FreeRdp,
+}
+
+impl SessionBackend {
+    /// The platform default: native on Windows, FreeRDP on Linux.
+    #[cfg_attr(windows, allow(dead_code))] // the Windows dispatch is unconditional
+    fn platform_default() -> Self {
+        if cfg!(windows) {
+            SessionBackend::Native
+        } else {
+            SessionBackend::FreeRdp
+        }
+    }
+}
+
 /// Minimal command-line arguments (no external arg-parsing dependency).
 #[derive(Debug)]
 struct Args {
@@ -725,6 +1058,23 @@ struct Args {
     /// Connect brokering instead of the JSON feed. Useful for replaying a file
     /// the Windows App generated.
     rdp_file: Option<String>,
+    /// Session backend for `--w365` (`--w365-backend native|freerdp`). Default:
+    /// the native rdpio stack on Windows, an upstream FreeRDP 3 client on Linux
+    /// (rdpio's own Linux W365 stack is not complete — see PORTING.md).
+    w365_backend: Option<SessionBackend>,
+    /// Force camera redirection on (`--camera`) or off (`--no-camera`) for the
+    /// Linux FreeRDP backend. Default: enable when the installed FreeRDP has
+    /// the upstream RDPECAM client and a local camera exists.
+    camera: Option<bool>,
+    /// Diagnose the W365/FreeRDP integration and exit (`--w365-doctor`).
+    w365_doctor: bool,
+    /// Write Microsoft's downloaded `.rdp` payload to this path as well
+    /// (`--save-rdp PATH`), for diagnostics. Diagnostic use only — the file
+    /// contains per-tenant connection material.
+    save_rdp: Option<String>,
+    /// Extra FreeRDP arguments passed verbatim (`--freerdp-arg /multimon`).
+    /// Repeatable; argv only, never a shell string.
+    freerdp_arg: Vec<String>,
     /// Host Microsoft's Teams WebRTC redirector add-in (`--teams`, alias
     /// `--webrtc`) so Teams reaches the "Optimized" state — A/V runs peer-to-peer
     /// from this client instead of through the RDP graphics stream. Windows only;
@@ -782,6 +1132,11 @@ impl Args {
             tenant: None,
             client_id: None,
             rdp_file: None,
+            w365_backend: None,
+            camera: None,
+            w365_doctor: false,
+            save_rdp: None,
+            freerdp_arg: Vec::new(),
             teams: false,
             teams_native: false,
         };
@@ -913,6 +1268,27 @@ impl Args {
                 "--w365" => args.w365 = true,
                 "--w365-device-code" => args.w365_device_code = true,
                 "--w365-relogin" | "--w365-logout" => args.w365_relogin = true,
+                "--w365-doctor" => args.w365_doctor = true,
+                "--w365-backend" => {
+                    if let Some(v) = it.next() {
+                        match v.trim().to_ascii_lowercase().as_str() {
+                            "native" => args.w365_backend = Some(SessionBackend::Native),
+                            "freerdp" => args.w365_backend = Some(SessionBackend::FreeRdp),
+                            other => tracing::warn!(
+                                backend = %other,
+                                "unknown --w365-backend (expected native|freerdp); using the platform default"
+                            ),
+                        }
+                    }
+                }
+                "--camera" => args.camera = Some(true),
+                "--no-camera" => args.camera = Some(false),
+                "--save-rdp" => args.save_rdp = it.next(),
+                "--freerdp-arg" => {
+                    if let Some(v) = it.next() {
+                        args.freerdp_arg.push(v);
+                    }
+                }
                 "--forget-password" => args.forget_password = true,
                 "--tenant" => args.tenant = it.next(),
                 "--client-id" => args.client_id = it.next(),
@@ -1052,12 +1428,24 @@ REDIRECTION
 
 WINDOWS 365 / CLOUD PC
     --w365                 Sign in to Windows 365 and connect to a Cloud PC.
+                           On Windows: rdpio's native stack. On Linux: rdpio
+                           discovers the workspace, downloads Microsoft's signed
+                           .rdp, and hands it to FreeRDP 3 (see PORTING.md).
     --w365-device-code     Use device-code sign-in (no local browser).
     --w365-relogin         Force a fresh sign-in, discarding cached tokens.
+    --w365-backend <B>     native|freerdp. Default: native on Windows,
+                           freerdp on Linux (Linux W365 only).
+    --camera               Require webcam redirection (Linux FreeRDP backend;
+                           fails if the FreeRDP build lacks MS-RDPECAM).
+    --no-camera            Disable webcam redirection for this session.
+    --freerdp-arg <ARG>    Pass an extra FreeRDP argument verbatim (repeatable),
+                           e.g. --freerdp-arg /multimon.
+    --save-rdp <PATH>      Save Microsoft's downloaded .rdp for diagnostics.
     --tenant <ID>          Entra tenant ID.
     --client-id <ID>       Override the OAuth client ID.
     --feed <URL>           Connect through a specific workspace feed URL.
     --rdp-file <PATH>      Read connection settings from an .rdp file.
+    --w365-doctor          Diagnose the W365 integration (Linux) and exit.
 
 DIAGNOSTICS
     --log-file <PATH>      Write the log to a file as well as the console.
@@ -3057,7 +3445,7 @@ mod win {
             // `--w365-relogin` discards any cached credentials so the user can
             // switch accounts / force a fresh MFA sign-in.
             if args.w365_relogin {
-                let _ = crate::token_cache::clear();
+                let _ = crate::token_cache::clear(tenant, args.client_id.as_deref());
                 let _ = crate::password_cache::clear();
             }
             // Reuse a cached refresh token when possible so we do not prompt for
@@ -4683,5 +5071,35 @@ mod policy_tests {
         assert_eq!(size, (3840, 1080));
         assert_eq!((defs[0].left, defs[0].right), (0, 1919));
         assert_eq!(slices[1], ((1920, 0), (1920, 1080)));
+    }
+}
+
+#[cfg(all(test, not(windows)))]
+mod w365_backend_tests {
+    use super::decide_camera;
+    use crate::freerdp_backend::RdpecamSupport as Rs;
+
+    #[test]
+    fn default_enables_camera_only_with_support_and_device() {
+        assert!(decide_camera(None, Rs::Yes, 1).unwrap());
+        assert!(!decide_camera(None, Rs::Yes, 0).unwrap());
+        assert!(!decide_camera(None, Rs::No, 3).unwrap());
+        // Unknown support keeps the default conservative but does not fail.
+        assert!(!decide_camera(None, Rs::Unknown, 3).unwrap());
+    }
+
+    #[test]
+    fn no_camera_flag_disables_everything() {
+        assert!(!decide_camera(Some(false), Rs::Yes, 5).unwrap());
+    }
+
+    #[test]
+    fn explicit_camera_requires_rdpecam_support() {
+        assert!(decide_camera(Some(true), Rs::Yes, 1).unwrap());
+        // No webcam + explicit --camera still connects (warning logged).
+        assert!(decide_camera(Some(true), Rs::Yes, 0).unwrap());
+        // Missing RDPECAM + explicit --camera is an actionable error.
+        let err = decide_camera(Some(true), Rs::No, 1).unwrap_err();
+        assert!(err.contains("CHANNEL_RDPECAM_CLIENT"), "error must name the build flag: {err}");
     }
 }
