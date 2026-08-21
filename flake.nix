@@ -2,9 +2,15 @@
   description = "RDPiO — GPU-accelerated RDP client; Windows 365 / AVD on Linux through FreeRDP";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+  # FreeRDP is pinned on its own nixpkgs revision (NOT followable): the ARM
+  # gateway + AAD path needs FreeRDP ≥ 3.25 — nixpkgs freerdp 3.24 stalls for
+  # minutes before its sign-in prompt — and consumers that follow their own
+  # nixpkgs must not silently downgrade the bundled client. rdpio itself
+  # builds fine on any nixpkgs.
+  inputs.nixpkgs-freerdp.url = "github:NixOS/nixpkgs/ffb3c9b700e759be2ef13237c9d8f953b32a1e46";
 
   outputs =
-    { self, nixpkgs }:
+    { self, nixpkgs, nixpkgs-freerdp }:
     let
       lib = nixpkgs.lib;
       systems = [
@@ -23,6 +29,9 @@
         system:
         let
           pkgs = nixpkgs.legacyPackages.${system};
+          # Dedicated pin: see inputs.nixpkgs-freerdp — the bundled FreeRDP
+          # must stay ≥ 3.25 even when a consumer's nixpkgs is older.
+          pkgsFreerdp = nixpkgs-freerdp.legacyPackages.${system};
         in
         rec {
           # The rdpio client itself. Pure-Rust workspace (bundled SQLite +
@@ -64,11 +73,11 @@
           # (CHANNEL_RDPECAM_CLIENT=ON; upstream default is OFF). The only
           # change vs stock nixpkgs FreeRDP — no source patching. libusb1 is
           # the one extra dependency the channel's v4l subsystem needs.
-          freerdp-ecam = pkgs.freerdp.overrideAttrs (old: {
+          freerdp-ecam = pkgsFreerdp.freerdp.overrideAttrs (old: {
             cmakeFlags = (old.cmakeFlags or [ ]) ++ [
               "-DCHANNEL_RDPECAM_CLIENT=ON"
             ];
-            buildInputs = (old.buildInputs or [ ]) ++ [ pkgs.libusb1 ];
+            buildInputs = (old.buildInputs or [ ]) ++ [ pkgsFreerdp.libusb1 ];
           });
 
           # Terminal-aware W365 launcher: pins RDPIO_FREERDP to the
